@@ -1,0 +1,65 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+
+# ---------- Jupyter ----------
+.ipynb_checkpoints/
+
+# ---------- OS / IDE ----------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ---------- Logs ----------
+*.log
+
+# ---------- Large outputs / runs ----------
+runs/
+outputs/
+output/
+results/
+inference_results/
+inference_result/
+*.mp4
+
+# ---------- Checkpoints / models ----------
+checkpoints/
+checkpoint/
+weights/
+weight/
+models/
+model_weights/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.engine
+
+# ---------- Datasets ----------
+data/
+dataset/
+datasets/
+MVTec*/
+mvtec*/
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# ---------- Images ----------
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tif
+*.tiff
+*.gif
