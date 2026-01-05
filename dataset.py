@@ -68,7 +68,9 @@ class MVTecDataset(Dataset):
             # Training only contains normal images
             train_dir = category_dir / 'train' / 'good'
             if train_dir.exists():
-                self.image_paths = sorted(list(train_dir.glob('*.png')))
+                self.image_paths = sorted(
+                    [p for ext in ("*.png", "*.jpg", "*.jpeg") for p in train_dir.glob(ext)]
+                )
                 self.labels = [0] * len(self.image_paths)  # 0 = normal
                 self.mask_paths = [None] * len(self.image_paths)
         
@@ -78,7 +80,9 @@ class MVTecDataset(Dataset):
             # Load normal test images
             good_dir = test_dir / 'good'
             if good_dir.exists():
-                good_images = sorted(list(good_dir.glob('*.png')))
+                good_images = sorted(
+                    [p for ext in ("*.png", "*.jpg", "*.jpeg") for p in good_dir.glob(ext)]
+                )
                 self.image_paths.extend(good_images)
                 self.labels.extend([0] * len(good_images))
                 self.mask_paths.extend([None] * len(good_images))
@@ -89,13 +93,35 @@ class MVTecDataset(Dataset):
                 if defect_dir.name == 'good' or not defect_dir.is_dir():
                     continue
                 
-                defect_images = sorted(list(defect_dir.glob('*.png')))
+                defect_images = sorted(
+                    [p for ext in ("*.png", "*.jpg", "*.jpeg") for p in defect_dir.glob(ext)]
+                )
                 self.image_paths.extend(defect_images)
                 self.labels.extend([1] * len(defect_images))  # 1 = anomaly
                 
-                # Load corresponding masks
+                IMG_EXTS = [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"]
+
                 for img_path in defect_images:
-                    mask_path = mask_dir / defect_dir.name / (img_path.stem + '_mask.png')
+                    # Try: <stem>_mask.<any ext>
+                    mask_path = None
+                    for ext in IMG_EXTS:
+                        p = mask_dir / defect_dir.name / f"{img_path.stem}_mask{ext}"
+                        if p.exists():
+                            mask_path = p
+                            break
+
+                    # Fallback: <stem>.<any ext>
+                    if mask_path is None:
+                        for ext in IMG_EXTS:
+                            p = mask_dir / defect_dir.name / f"{img_path.stem}{ext}"
+                            if p.exists():
+                                mask_path = p
+                                break
+
+                    if mask_path is None:
+                        # not found → skip / handle error
+                        continue
+
                     self.mask_paths.append(mask_path if mask_path.exists() else None)
         
         print(f"Loaded {len(self.image_paths)} images for {self.category} ({self.split})")
