@@ -14,7 +14,29 @@ import json
 from model import FastFlowModel
 from dataset import MVTecDataModule
 from trainer import FastFlowTrainer, FastFlowEvaluator
+from torchvision.transforms import v2 as T
 
+def make_train_tf(pre_h, pre_w, h, w):
+    return T.Compose([
+        T.Resize((pre_h, pre_w), antialias=True),
+        T.CenterCrop((h, w)),
+
+        T.RandomHorizontalFlip(p=0.5),
+        T.RandomVerticalFlip(p=0.5),
+
+        T.ToDtype(torch.float32, scale=True),
+        T.Normalize([0.485, 0.456, 0.406],
+                    [0.229, 0.224, 0.225]),
+    ])
+
+def make_det_tf(pre_h, pre_w, h, w):
+    return T.Compose([
+        T.Resize((pre_h, pre_w), antialias=True),
+        T.CenterCrop((h, w)),
+        T.ToDtype(torch.float32, scale=True),
+        T.Normalize(mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225]),
+    ])
 
 class FastFlowPipeline:
     """Complete pipeline for FastFlow training and evaluation"""
@@ -44,7 +66,15 @@ class FastFlowPipeline:
             clamp=self.config.get("clamp", 2.0),
             conv3x3_only=self.config.get("conv3x3_only", False),
         )
-        
+        import math
+        h, w = self.config['image_size'] 
+        crop_scale = 0.875
+        pre_h = int(math.ceil(h / crop_scale))
+        pre_w = int(math.ceil(w / crop_scale))  
+
+        train_tf = make_train_tf(pre_h, pre_w, h, w)
+        test_tf  = make_det_tf(pre_h, pre_w, h, w)  # usually keep test deterministic too
+
         # Initialize data module
         print(f"Loading MVTec dataset - Category: {self.config['category']}")
         self.data_module = MVTecDataModule(
@@ -52,7 +82,9 @@ class FastFlowPipeline:
             category=self.config['category'],
             batch_size=self.config['batch_size'],
             num_workers=self.config['num_workers'],
-            image_size=tuple(self.config['image_size'])
+            image_size=tuple(self.config['image_size']),
+            train_transform=train_tf,
+            test_transform=test_tf,
         )
         self.data_module.setup()
         

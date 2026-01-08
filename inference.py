@@ -45,18 +45,29 @@ class FastFlowInference:
         self.model.to(self.device)
         self.model.eval()
 
-        self.transform = A.Compose(
-            [
-                A.Resize(height=self.image_size[0], width=self.image_size[1]),
-                A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                ToTensorV2(),
-            ]
-        )
+        from torchvision.transforms import v2 as T
+
+        import math
+        h, w = image_size
+        crop_scale = 0.875
+        pre_h = int(math.ceil(h / crop_scale))
+        pre_w = int(math.ceil(w / crop_scale))  
+
+        self.transform = T.Compose([
+            T.ToImage(),                        # <-- important (PIL/np -> tensor image)
+            T.Resize((pre_h, pre_w), antialias=True),
+            T.CenterCrop((h, w)),
+            T.ToDtype(torch.float32, scale=True),
+            T.Normalize(mean=[0.485, 0.456, 0.406],
+                        std=[0.229, 0.224, 0.225]),
+        ])
 
     def preprocess_image(self, image_path: str):
-        orig = np.array(Image.open(image_path).convert("RGB"))  # HWC RGB uint8
-        t = self.transform(image=orig)
-        x = t["image"].unsqueeze(0)  # [1,3,H,W]
+        image_pil = Image.open(image_path).convert("RGB")
+        orig = np.array(image_pil)                 # keep for visualization (HWC RGB uint8)
+
+        x = self.transform(image_pil)              # <-- NO keyword args
+        x = x.unsqueeze(0)                         # [1,3,H,W]
         return x, orig
 
     @torch.inference_mode()

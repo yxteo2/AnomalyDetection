@@ -9,7 +9,20 @@ import torchvision.models as models
 # Glow-style invertible parts
 # (we keep ActNorm + Inv1x1Conv, but expose anomalib-style outputs)
 # -----------------------------
+class LocalConvContext(nn.Module):
+    """Learnable local neighborhood mixing: x + PW(DW(x))."""
+    def __init__(self, c: int, k: int = 3):
+        super().__init__()
+        self.dw = nn.Conv2d(c, c, kernel_size=k, padding=k//2, groups=c, bias=False)
+        self.pw = nn.Conv2d(c, c, kernel_size=1, bias=False)
 
+        # Start as exact identity (pw=0 => output = x), but gradients can still flow
+        nn.init.kaiming_normal_(self.dw.weight, nonlinearity="linear")
+        nn.init.zeros_(self.pw.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pw(self.dw(x))
+    
 class ActNorm2d(nn.Module):
     """ActNorm (Glow): per-channel affine transform with data-dependent init."""
     def __init__(self, num_channels: int, eps: float = 1e-6):
@@ -190,7 +203,13 @@ class FastFlowModel(nn.Module):
         self.hidden_ratio = hidden_ratio
         self.clamp = clamp
 
+        self.feat_drop = nn.ModuleList([
+            nn.Dropout2d(p=0.1),  # try 0.05~0.2
+            nn.Dropout2d(p=0.1),
+            nn.Dropout2d(p=0.1),
+        ])
         self.backbone, self.feature_channels, self.scales = self._build_backbone(backbone_name, input_size)
+        self.context = nn.ModuleList([LocalConvContext(ch, k=3) for ch in self.feature_channels])
 
         # trainable LayerNorm per level like anomalib for CNN backbones :contentReference[oaicite:3]{index=3}
         self.norms = nn.ModuleList()
@@ -248,6 +267,10 @@ class FastFlowModel(nn.Module):
 
         feats = [f1, f2, f3]
         feats = [self.norms[i](feat) for i, feat in enumerate(feats)]
+
+        feats = [self.context[i](feat) for i, feat in enumerate(feats)]
+        if self.training:
+            feats = [self.feat_drop[i](feat) for i, feat in enumerate(feats)]
         return feats
 
     def forward(self, x: torch.Tensor):
