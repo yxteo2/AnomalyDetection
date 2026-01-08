@@ -294,4 +294,4 @@ class FastFlowModel(nn.Module):
         if self.training:
             return hidden_variables, jacobians
 
-        return self.anomaly_map_generator(hidden_variables)
+        return self.anomaly_map_generator(hidden_variables)  
