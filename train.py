@@ -23,7 +23,7 @@ def make_train_tf(pre_h, pre_w, h, w):
 
         T.RandomHorizontalFlip(p=0.5),
         T.RandomVerticalFlip(p=0.5),
-
+        T.RandomRotation(degrees=10),
         T.ToDtype(torch.float32, scale=True),
         T.Normalize([0.485, 0.456, 0.406],
                     [0.229, 0.224, 0.225]),

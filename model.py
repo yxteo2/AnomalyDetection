@@ -204,9 +204,9 @@ class FastFlowModel(nn.Module):
         self.clamp = clamp
 
         self.feat_drop = nn.ModuleList([
-            nn.Dropout2d(p=0.1),  # try 0.05~0.2
-            nn.Dropout2d(p=0.1),
-            nn.Dropout2d(p=0.1),
+            nn.Dropout2d(p=0.15),  # try 0.05~0.2
+            nn.Dropout2d(p=0.15),
+            nn.Dropout2d(p=0.15),
         ])
         self.backbone, self.feature_channels, self.scales = self._build_backbone(backbone_name, input_size)
         self.context = nn.ModuleList([LocalConvContext(ch, k=3) for ch in self.feature_channels])
