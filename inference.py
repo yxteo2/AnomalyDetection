@@ -9,7 +9,7 @@ from PIL import Image
 import cv2
 
 from anomalib.metrics.threshold import F1AdaptiveThreshold
-from model import FastFlowModel
+from model.fastflow import FastFlowModel
 
 
 class FastFlowInference:
