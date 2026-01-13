@@ -1,5 +1,5 @@
-from fastflow import FastFlowModel
-from supersimplenet import SuperSimpleNetModel
+from model.fastflow import FastFlowModel
+from model.supersimplenet import SuperSimpleNetModel
 __all__ = [
     "FastFlowModel",
     "SuperSimpleNetModel",]
