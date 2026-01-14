@@ -13,7 +13,8 @@ import json
 # Import custom modules
 from model import FastFlowModel, SuperSimpleNetModel
 from dataset import MVTecDataModule
-from trainer import FastFlowTrainer, FastFlowEvaluator, SuperSimpleNetTrainer, SuperSimpleNetEvaluator
+from trainer import FastFlowTrainer, FastFlowEvaluator
+from ssntrainer import SuperSimpleNetTrainer, SuperSimpleNetEvaluator
 from torchvision.transforms import v2 as T
 
 def make_train_tf(pre_h, pre_w, h, w):
@@ -74,10 +75,12 @@ class FastFlowPipeline:
                 backbone_name=self.config["backbone"],
                 flow_steps=self.config["flow_steps"],
                 input_size=tuple(self.config["image_size"]),
+                reducer_channels=(128, 192, 256),  # start here
                 hidden_ratio=self.config.get("hidden_ratio", 1.0),
                 clamp=self.config.get("clamp", 2.0),
                 conv3x3_only=self.config.get("conv3x3_only", False),
             )
+
         import math
         h, w = self.config['image_size'] 
         crop_scale = 0.875
@@ -104,15 +107,25 @@ class FastFlowPipeline:
         save_dir = Path(self.config['save_dir']) / self.config['category']
         if self.config.get("model", "fastflow") == "ssn":
             self.trainer = SuperSimpleNetTrainer(
-                model=self.model,
-                device=str(self.device),
-                save_dir=str(save_dir),
-                monitor="image_auroc",
-                maximize=True,
-            )
+            model=self.model,
+            device=str(self.device),
+            save_dir=str(save_dir),
+            monitor="image_auroc",
+            maximize=True,
+            model_cfg={
+                "perlin_threshold": self.config.get("perlin_threshold", 0.2),
+                "backbone_name": self.config["backbone"],
+                "layers": ["layer2", "layer3"],
+                "stop_grad": True,
+                "adapt_cls_features": self.config.get("adapt_cls_features", False),
+                "input_size": tuple(self.config["image_size"]),
+                "pretrained_backbone": True,
+            }
+        )
         else:
             self.trainer = FastFlowTrainer(
                 model=self.model,
+                backbone_name=self.config['backbone'],
                 device=str(self.device),
                 learning_rate=self.config['learning_rate'],
                 weight_decay=self.config['weight_decay'],
@@ -172,13 +185,15 @@ class FastFlowPipeline:
             json.dump(metrics, f, indent=4)
         print(f"\nMetrics saved to {metrics_path}")
         
-        # Visualize results
         results_dir = save_dir / 'visualizations'
-        self.evaluator.visualize_results(
-            test_loader,
-            save_dir=str(results_dir),
-            num_samples=self.config['num_visualizations']
-        )
+        if hasattr(self.evaluator, "visualize_results"):
+            self.evaluator.visualize_results(
+                test_loader,
+                save_dir=str(results_dir),
+                num_samples=self.config['num_visualizations']
+            )
+        else:
+            print("[Info] visualize_results not implemented for this evaluator. Skipping visualization.")
         
         return metrics
     
@@ -230,7 +245,7 @@ def parse_args():
                         help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-5,
                         help='Weight decay')
-    parser.add_argument('--patience', type=int, default=10,
+    parser.add_argument('--patience', type=int, default=30,
                         help='Early stopping patience')
     
     # Other arguments

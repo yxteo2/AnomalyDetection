@@ -181,12 +181,6 @@ class AnomalyMapGenerator(nn.Module):
 
 
 class FastFlowModel(nn.Module):
-    """
-    Anomalib-style interface:
-      - train(): returns (hidden_variables, jacobians)
-      - eval():  returns anomaly_map
-    """
-
     def __init__(
         self,
         backbone_name: str = "resnet18",
@@ -195,6 +189,8 @@ class FastFlowModel(nn.Module):
         conv3x3_only: bool = False,
         hidden_ratio: float = 1.0,
         clamp: float = 2.0,
+        reducer_channels: Tuple[int, int, int] = (128, 192, 256),  # ✅ NEW
+        use_reducers: bool = False,                                 # ✅ NEW
     ):
         super().__init__()
         self.input_size = input_size
@@ -202,31 +198,48 @@ class FastFlowModel(nn.Module):
         self.conv3x3_only = conv3x3_only
         self.hidden_ratio = hidden_ratio
         self.clamp = clamp
+        self.use_reducers = use_reducers
 
         self.feat_drop = nn.ModuleList([
-            nn.Dropout2d(p=0.15),  # try 0.05~0.2
+            nn.Dropout2d(p=0.15),
             nn.Dropout2d(p=0.15),
             nn.Dropout2d(p=0.15),
         ])
-        self.backbone, self.feature_channels, self.scales = self._build_backbone(backbone_name, input_size)
+
+        # backbone gives us ORIGINAL channels
+        self.backbone, orig_channels, self.scales = self._build_backbone(backbone_name, input_size)
+
+        if backbone_name == "wide_resnet50_2":
+            use_reducers = True
+        reducer_channels = (128, 192, 256)  # must match number of levels (3)
+
+        if self.use_reducers:
+            assert len(reducer_channels) == len(orig_channels)
+            self.reducers = nn.ModuleList([
+                nn.Conv2d(in_c, out_c, kernel_size=1, bias=False)
+                for in_c, out_c in zip(orig_channels, reducer_channels)
+            ])
+            self.feature_channels = list(reducer_channels)   # IMPORTANT: flows/norms use reduced
+        else:
+            self.reducers = None
+            self.feature_channels = list(orig_channels)
+
+        # context uses reduced channels
         self.context = nn.ModuleList([LocalConvContext(ch, k=3) for ch in self.feature_channels])
 
-        # trainable LayerNorm per level like anomalib for CNN backbones :contentReference[oaicite:3]{index=3}
+        # LayerNorm shapes should match reduced channels
         self.norms = nn.ModuleList()
         for ch, sc in zip(self.feature_channels, self.scales):
             h = int(input_size[0] / sc)
             w = int(input_size[1] / sc)
             self.norms.append(nn.LayerNorm([ch, h, w], elementwise_affine=True))
 
-        # flows per feature level
+        # flows per feature level (reduced channels)
         self.blocks = nn.ModuleList()
         for ch in self.feature_channels:
             steps = nn.ModuleList()
             for i in range(flow_steps):
-                if (i % 2 == 1) and (not conv3x3_only):
-                    k = 1
-                else:
-                    k = 3
+                k = 1 if ((i % 2 == 1) and (not conv3x3_only)) else 3
                 steps.append(FastFlowStep(ch, hidden_ratio=hidden_ratio, kernel_size=k, clamp=clamp))
             self.blocks.append(steps)
 
@@ -254,21 +267,25 @@ class FastFlowModel(nn.Module):
         return net, channels, scales
 
     def _extract_features(self, x: torch.Tensor) -> List[torch.Tensor]:
-        # ResNet forward manually for layer1/2/3 features
         net = self.backbone
         x = net.conv1(x)
         x = net.bn1(x)
         x = net.relu(x)
         x = net.maxpool(x)
 
-        f1 = net.layer1(x)  # scale /4
+        f1 = net.layer1(x)  # /4
         f2 = net.layer2(f1) # /8
         f3 = net.layer3(f2) # /16
 
         feats = [f1, f2, f3]
-        feats = [self.norms[i](feat) for i, feat in enumerate(feats)]
 
+        # ✅ reduce channels BEFORE LayerNorm/context/flows
+        if self.use_reducers and (self.reducers is not None):
+            feats = [self.reducers[i](feat) for i, feat in enumerate(feats)]
+
+        feats = [self.norms[i](feat) for i, feat in enumerate(feats)]
         feats = [self.context[i](feat) for i, feat in enumerate(feats)]
+
         if self.training:
             feats = [self.feat_drop[i](feat) for i, feat in enumerate(feats)]
         return feats
