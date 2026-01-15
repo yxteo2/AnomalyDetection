@@ -71,15 +71,25 @@ class FastFlowPipeline:
             )
         else:
             print(f"\nInitializing FastFlow model with backbone: {self.config['backbone']}")
-            self.model = FastFlowModel(
-                backbone_name=self.config["backbone"],
-                flow_steps=self.config["flow_steps"],
-                input_size=tuple(self.config["image_size"]),
-                reducer_channels=(128, 192, 256),  # start here
-                hidden_ratio=self.config.get("hidden_ratio", 1.0),
-                clamp=self.config.get("clamp", 2.0),
-                conv3x3_only=self.config.get("conv3x3_only", False),
-            )
+            if self.config['backbone'] == 'wide_resnet50_2':
+                self.model = FastFlowModel(
+                    backbone_name=self.config["backbone"],
+                    flow_steps=self.config["flow_steps"],
+                    input_size=tuple(self.config["image_size"]),
+                    reducer_channels=(128, 192, 256),  # start here
+                    hidden_ratio=self.config.get("hidden_ratio", 1.0),
+                    clamp=self.config.get("clamp", 2.0),
+                    conv3x3_only=self.config.get("conv3x3_only", False),
+                )
+            else:
+                self.model = FastFlowModel(
+                    backbone_name=self.config["backbone"],
+                    flow_steps=self.config["flow_steps"],
+                    input_size=tuple(self.config["image_size"]),
+                    hidden_ratio=self.config.get("hidden_ratio", 1.0),
+                    clamp=self.config.get("clamp", 2.0),
+                    conv3x3_only=self.config.get("conv3x3_only", False),
+                )
 
         import math
         h, w = self.config['image_size'] 
@@ -241,7 +251,7 @@ def parse_args():
                         help='Batch size')
     parser.add_argument('--num_epochs', type=int, default=100,
                         help='Number of training epochs')
-    parser.add_argument('--learning_rate', type=float, default=1e-3,
+    parser.add_argument('--learning_rate', type=float, default=1e-4,
                         help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-5,
                         help='Weight decay')
