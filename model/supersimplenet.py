@@ -1,12 +1,12 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import List, Tuple
-import torchvision.models as models
 import math
 from typing import List, Tuple, Optional
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as models
 from torchvision.models.feature_extraction import create_feature_extractor
+
 
 def _init_weights(module: nn.Module) -> None:
     """Xavier init for Linear/Conv and constant=1 for BN weights."""
@@ -31,7 +31,6 @@ class GaussianBlur2d(nn.Module):
         self.kernel_size = int(kernel_size)
         self.sigma = float(sigma)
 
-        # Create 2D Gaussian kernel
         ax = torch.arange(self.kernel_size) - self.kernel_size // 2
         xx, yy = torch.meshgrid(ax, ax, indexing="ij")
         kernel = torch.exp(-(xx**2 + yy**2) / (2 * (self.sigma**2)))
@@ -39,10 +38,9 @@ class GaussianBlur2d(nn.Module):
         self.register_buffer("kernel", kernel[None, None, :, :])  # (1,1,k,k)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B,1,H,W) typically
-        b, c, h, w = x.shape
+        # x: (B,C,H,W)
+        _, c, _, _ = x.shape
         k = self.kernel.to(dtype=x.dtype, device=x.device)
-        # depthwise: apply same kernel per channel
         k = k.expand(c, 1, self.kernel_size, self.kernel_size)
         return F.conv2d(x, k, padding=self.kernel_size // 2, groups=c)
 
@@ -50,11 +48,10 @@ class GaussianBlur2d(nn.Module):
 class UpscalingFeatureExtractor(nn.Module):
     """Frozen backbone feature extractor with upscaling + patch aggregation.
 
-    Matches the anomalib SSN idea:
-    - extract layers (typically layer2, layer3)
+    - extract layers (e.g. layer2, layer3)
     - upsample ALL selected layers to (2x the largest selected layer)
     - channel-wise concat
-    - avgpool with stride=1 for local patch aggregation
+    - avgpool stride=1 for local patch aggregation
     """
 
     def __init__(self, backbone_name: str, layers: List[str], patch_size: int = 3, pretrained: bool = True):
@@ -80,10 +77,10 @@ class UpscalingFeatureExtractor(nn.Module):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feats = self.feature_extractor(x)
-        feat_list = [feats[k] for k in self.layers]
+        feats = self.feature_extractor(x)              # dict[layer_name -> tensor]
+        feat_list = [feats[k] for k in self.layers]    # preserve user order
 
-        # "first" (largest) is typically layer2 for ResNets
+        # "first" (largest) typically layer2 for ResNets
         _, _, h, w = feat_list[0].shape
         target_hw = (h * 2, w * 2)
 
@@ -111,10 +108,7 @@ class FeatureAdapter(nn.Module):
 
 
 class _PerlinLikeMask(nn.Module):
-    """Lightweight Perlin-like smooth noise mask via low-res noise upsample.
-
-    The anomalib repo uses real Perlin noise; this is a close, fast approximation.
-    """
+    """Lightweight Perlin-like smooth noise mask via low-res noise upsample."""
 
     def __init__(self, base_res: int = 4):
         super().__init__()
@@ -123,21 +117,13 @@ class _PerlinLikeMask(nn.Module):
     def forward(self, b: int, h: int, w: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         n = torch.rand((b, 1, self.base_res, self.base_res), device=device, dtype=dtype)
         n = F.interpolate(n, size=(h, w), mode="bicubic", align_corners=False)
-        # normalize per-sample
         nmin = n.amin(dim=(2, 3), keepdim=True)
         nmax = n.amax(dim=(2, 3), keepdim=True)
         return (n - nmin) / (nmax - nmin + 1e-6)
 
 
 class AnomalyGenerator(nn.Module):
-    """Feature-level synthetic anomaly generator (train-time only).
-
-    Creates a batch of size 2B:
-      - first B are untouched (label 0)
-      - second B are noised inside a smooth mask (label 1)
-
-    If both `input_features` and `adapted_features` are given, applies the SAME noise mask to both.
-    """
+    """Feature-level synthetic anomaly generator (train-time only)."""
 
     def __init__(self, noise_mean: float = 0.0, noise_std: float = 0.015, threshold: float = 0.2, base_res: int = 4):
         super().__init__()
@@ -153,15 +139,12 @@ class AnomalyGenerator(nn.Module):
         masks: torch.Tensor,
         labels: Optional[torch.Tensor],
     ):
-        # expected masks are already at feature resolution (B,1,H,W)
         b, c_ad, h, w = adapted_features.shape
         device, dtype = adapted_features.device, adapted_features.dtype
 
-        # duplicate
         adapted2 = adapted_features.repeat(2, 1, 1, 1)
         input2 = input_features.repeat(2, 1, 1, 1) if input_features is not None else None
 
-        # build synthetic mask for second half
         smooth = self.mask_gen(b, h, w, device=device, dtype=dtype)
         m = (smooth > self.threshold).float()
 
@@ -176,11 +159,9 @@ class AnomalyGenerator(nn.Module):
         masks2 = masks.repeat(2, 1, 1, 1)
         labels2 = torch.zeros((2 * b,), device=device, dtype=torch.float32)
 
-        # in unsupervised setting, original masks are all zeros; synthetic mask becomes target for second half
         masks2[b:] = m
         labels2[b:] = 1.0
 
-        # if user provided labels (supervised/mixed), keep them for first half
         if labels is not None:
             labels2[:b] = labels.view(-1).to(dtype=torch.float32)
 
@@ -188,13 +169,12 @@ class AnomalyGenerator(nn.Module):
 
 
 class SegmentationDetectionModule(nn.Module):
-    """Anomalib SSN seg+cls module."""
+    """SSN seg+cls module."""
 
     def __init__(self, channel_dim: int, stop_grad: bool = True):
         super().__init__()
         self.stop_grad = bool(stop_grad)
 
-        # segmentation head
         self.seg_head = nn.Sequential(
             nn.Conv2d(channel_dim, 1024, kernel_size=1, stride=1),
             nn.BatchNorm2d(1024),
@@ -202,13 +182,12 @@ class SegmentationDetectionModule(nn.Module):
             nn.Conv2d(1024, 1, kernel_size=1, stride=1, bias=False),
         )
 
-        # classification head
         self.cls_conv = nn.Sequential(
             nn.Conv2d(channel_dim + 1, 128, kernel_size=5, padding="same"),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
         )
-        # pooling
+
         self.map_avg_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.map_max_pool = nn.AdaptiveMaxPool2d((1, 1))
         self.dec_avg_pool = nn.AdaptiveAvgPool2d((1, 1))
@@ -224,18 +203,20 @@ class SegmentationDetectionModule(nn.Module):
         dec_in = torch.cat([cls_features, map_dec_copy], dim=1)
         dec_out = self.cls_conv(dec_in)
 
-        dec_max = self.dec_max_pool(dec_out)
-        dec_avg = self.dec_avg_pool(dec_out)
+        dec_max = self.dec_max_pool(dec_out)  # (B,128,1,1)
+        dec_avg = self.dec_avg_pool(dec_out)  # (B,128,1,1)
 
-        map_max = self.map_max_pool(ano_map)
-        map_avg = self.map_avg_pool(ano_map)
+        map_max = self.map_max_pool(ano_map)  # (B,1,1,1)
+        map_avg = self.map_avg_pool(ano_map)  # (B,1,1,1)
         if self.stop_grad:
             map_max = map_max.detach()
             map_avg = map_avg.detach()
 
-        dec_cat = torch.cat([dec_max, dec_avg, map_max, map_avg], dim=1).squeeze()
-        ano_score = self.cls_fc(dec_cat).reshape(-1)  # (B,)
+        # IMPORTANT: don't squeeze() (breaks when B=1)
+        dec_cat = torch.cat([dec_max, dec_avg, map_max, map_avg], dim=1)  # (B,258,1,1)
+        dec_cat = dec_cat.view(dec_cat.size(0), -1)                      # (B,258)
 
+        ano_score = self.cls_fc(dec_cat).reshape(-1)  # (B,)
         return ano_map, ano_score
 
 
@@ -253,21 +234,13 @@ class SSNAnomalyMapGenerator(nn.Module):
 
 
 class SuperSimpleNetModel(nn.Module):
-    """SuperSimpleNet model aligned to anomalib's implementation.
-
-    Key behavioral points (same as anomalib):
-    - backbone frozen
-    - anomaly generator duplicates batch (normal + synthetic)
-    - stop_grad=True in unsupervised mode
-    - during training returns logits + targets
-    - during eval returns sigmoid(map/score)
-    """
+    """SuperSimpleNet model aligned to anomalib's behavior."""
 
     def __init__(
         self,
         perlin_threshold: float = 0.2,
         backbone_name: str = "wide_resnet50_2",
-        layers: List[str] = ["layer2", "layer3"],
+        layers: Optional[List[str]] = None,
         stop_grad: bool = True,
         adapt_cls_features: bool = False,
         input_size: Tuple[int, int] = (256, 256),
@@ -276,14 +249,16 @@ class SuperSimpleNetModel(nn.Module):
         super().__init__()
         self.input_size = tuple(input_size)
         self.adapt_cls_features = bool(adapt_cls_features)
+        self.layers = list(layers) if layers is not None else ["layer2", "layer3"]
 
         self.feature_extractor = UpscalingFeatureExtractor(
             backbone_name=backbone_name,
-            layers=layers,
+            layers=self.layers,
             patch_size=3,
             pretrained=pretrained_backbone,
         )
-        channels = self.feature_extractor.get_channels_dim()
+
+        channels = self.feature_extractor.get_channels_dim(probe_hw=self.input_size)
 
         self.adaptor = FeatureAdapter(channels)
         self.segdec = SegmentationDetectionModule(channel_dim=channels, stop_grad=stop_grad)
@@ -296,14 +271,18 @@ class SuperSimpleNetModel(nn.Module):
         masks = F.interpolate(masks, size=(feat_h, feat_w), mode="bilinear", align_corners=False)
         return torch.where(masks < 0.5, torch.zeros_like(masks), torch.ones_like(masks))
 
-    def forward(self, images: torch.Tensor, masks: Optional[torch.Tensor] = None, labels: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        images: torch.Tensor,
+        masks: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+    ):
         out_hw = images.shape[-2:]
 
-        features = self.feature_extractor(images)
+        features = self.feature_extractor(images)   # (B,C,Hf,Wf)
         adapted = self.adaptor(features)
 
         if self.training:
-            # unsupervised: masks/labels can be None -> create zeros at feature resolution
             if masks is None:
                 b, _, h, w = features.shape
                 masks = torch.zeros((b, 1, h, w), dtype=torch.float32, device=features.device)
@@ -314,7 +293,6 @@ class SuperSimpleNetModel(nn.Module):
                 labels = labels.to(dtype=torch.float32)
 
             if self.adapt_cls_features:
-                # ICPR style: both heads use adapted
                 _, noised_adapt, masks2, labels2 = self.anomaly_generator(
                     input_features=None,
                     adapted_features=adapted,
@@ -324,7 +302,6 @@ class SuperSimpleNetModel(nn.Module):
                 seg_feats = noised_adapt
                 cls_feats = noised_adapt
             else:
-                # JIMS extension: apply same noise to raw + adapted; cls uses raw features
                 noised_feat, noised_adapt, masks2, labels2 = self.anomaly_generator(
                     input_features=features,
                     adapted_features=adapted,
@@ -344,5 +321,4 @@ class SuperSimpleNetModel(nn.Module):
 
         pred_map = self.anomaly_map_generator(pred_map, final_size=out_hw).sigmoid()
         pred_score = pred_score.sigmoid()
-
         return pred_map, pred_score

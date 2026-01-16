@@ -1,8 +1,8 @@
-# inference.py
-# OOP FastFlow inference for MVTec:
+# ssn_inference.py
+# OOP SuperSimpleNet (SSN) inference for MVTec:
 # - exact Resize->CenterCrop preprocessing (torchvision v2)
 # - image-level: Accuracy, Precision, AUROC + F1AdaptiveThreshold for image threshold (auto direction)
-# - pixel-level: AUROC (sampled) + **SELF-IMPLEMENTED AUPRO** (region overlap) on globally-normalized maps
+# - pixel-level: AUROC (sampled) + SELF-IMPLEMENTED AUPRO (region overlap) on anomaly maps
 # - contour overlay drawn on ORIGINAL image, but thresholding done in crop-space then "uncropped" back
 
 import argparse
@@ -17,7 +17,7 @@ import torch
 from PIL import Image
 
 from anomalib.metrics.threshold import F1AdaptiveThreshold
-from model import FastFlowModel
+from model import SuperSimpleNetModel  # uses your SSN implementation
 
 
 # ============================================================
@@ -46,7 +46,6 @@ class SelfAUPRO:
         if target.dim() == 4 and target.size(1) == 1:
             target = target.squeeze(1)
 
-        # store on CPU to reduce GPU memory
         preds = preds.detach().float().cpu()
         target = target.detach().float().cpu()
 
@@ -56,7 +55,6 @@ class SelfAUPRO:
         else:
             target = (target > 0.5).float()
 
-        # clamp preds
         preds = preds.clamp(0.0, 1.0)
 
         self._preds.append(preds)
@@ -64,15 +62,12 @@ class SelfAUPRO:
 
     @staticmethod
     def _cca_cv2(mask01: np.ndarray) -> np.ndarray:
-        """Connected components for one image. mask01 is {0,1} uint8."""
         mask01 = (mask01 > 0).astype(np.uint8)
-        # returns labels in [0..N]
         _, labels = cv2.connectedComponents(mask01, connectivity=8)
         return labels.astype(np.int32)
 
     @staticmethod
     def _make_global_region_labels(cca_bhw: torch.Tensor) -> torch.Tensor:
-        """Offset connected component labels across batch to make them unique (except 0 background)."""
         cca_off = cca_bhw.clone()
         current_offset = 0
         B = int(cca_off.size(0))
@@ -90,24 +85,21 @@ class SelfAUPRO:
         return cca_off
 
     def perform_cca(self) -> torch.Tensor:
-        """Return (B,H,W) integer labels; 0 is background; >0 are region IDs unique across batch."""
         target = torch.cat(self._target, dim=0)  # (B,H,W)
         if target.min() < 0 or target.max() > 1:
             raise ValueError(f"AUPRO expects target in [0,1], got [{float(target.min())},{float(target.max())}]")
 
-        # CPU CCA via OpenCV per image
         target_np = target.numpy()
         ccas = []
         for b in range(target_np.shape[0]):
             labels = self._cca_cv2(target_np[b])
             ccas.append(labels)
-        cca = torch.from_numpy(np.stack(ccas, axis=0))  # (B,H,W) int32
+        cca = torch.from_numpy(np.stack(ccas, axis=0))
         cca = self._make_global_region_labels(cca)
         return cca.long()
 
     @staticmethod
     def _auc_trapz(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Trapezoidal integration (assumes x sorted ascending)."""
         if x.numel() < 2:
             return torch.tensor(0.0, device=x.device, dtype=torch.float32)
         dx = x[1:] - x[:-1]
@@ -115,13 +107,7 @@ class SelfAUPRO:
         return torch.sum(dx * avg)
 
     def compute_pro(self, cca: torch.Tensor, preds: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute PRO curve (FPR vs averaged per-region overlap).
-        cca:   (B,H,W) int labels, 0 background
-        preds: (B,H,W) float, higher => more anomalous
-        """
         device = preds.device
-
         labels = cca.reshape(-1).long()
         preds_flat = preds.reshape(-1).float()
 
@@ -130,28 +116,17 @@ class SelfAUPRO:
         num_bg = fp_change.sum()
 
         f_lim = float(self.fpr_limit)
-
         if num_bg <= 0:
-            return (
-                torch.tensor([0.0, f_lim], device=device),
-                torch.tensor([0.0, 0.0], device=device),
-            )
+            return (torch.tensor([0.0, f_lim], device=device), torch.tensor([0.0, 0.0], device=device))
 
         max_label = int(labels.max().item())
         if max_label == 0:
-            return (
-                torch.tensor([0.0, f_lim], device=device),
-                torch.tensor([0.0, 0.0], device=device),
-            )
+            return (torch.tensor([0.0, f_lim], device=device), torch.tensor([0.0, 0.0], device=device))
 
         region_sizes = torch.bincount(labels, minlength=max_label + 1).float()
         num_regions = (region_sizes[1:] > 0).sum()
-
         if num_regions <= 0:
-            return (
-                torch.tensor([0.0, f_lim], device=device),
-                torch.tensor([0.0, 0.0], device=device),
-            )
+            return (torch.tensor([0.0, f_lim], device=device), torch.tensor([0.0, 0.0], device=device))
 
         fg_mask = labels > 0
         pro_change = torch.zeros_like(preds_flat)
@@ -167,17 +142,14 @@ class SelfAUPRO:
         fpr = torch.clamp(fpr, max=1.0)
         pro = torch.clamp(pro, max=1.0)
 
-        # remove duplicate thresholds
         keep = torch.ones_like(preds_sorted, dtype=torch.bool)
         keep[:-1] = preds_sorted[:-1] != preds_sorted[1:]
         fpr = fpr[keep]
         pro = pro[keep]
 
-        # prepend zero
         fpr = torch.cat([torch.tensor([0.0], device=device), fpr])
         pro = torch.cat([torch.tensor([0.0], device=device), pro])
 
-        # clip at fpr_limit with linear interpolation
         mask = fpr <= f_lim
         if mask.any():
             i = int(mask.nonzero(as_tuple=True)[0][-1].item())
@@ -200,15 +172,13 @@ class SelfAUPRO:
         if not self._preds:
             return torch.tensor(0.0)
 
-        cca = self.perform_cca()               # (B,H,W) on CPU
-        preds = torch.cat(self._preds, dim=0)  # (B,H,W) on CPU
+        cca = self.perform_cca()
+        preds = torch.cat(self._preds, dim=0)
 
-        # compute PRO curve on CPU tensors
         fpr, pro = self.compute_pro(cca=cca, preds=preds)
-
         area = self._auc_trapz(fpr, pro)
-        # normalize by fpr_limit (or by last x)
-        denom = fpr[-1].clamp_min(1e-12)
+
+        denom = fpr[-1].clamp_min(1e-12)  # usually == fpr_limit
         return area / denom
 
 
@@ -337,62 +307,53 @@ def load_gt_mask_mvtec(img_path: Path) -> Optional[np.ndarray]:
 
 
 # -----------------------------
-# Core OOP runner
+# Core OOP runner (SSN)
 # -----------------------------
 @dataclass
 class Sample:
     path: Path
     gt_label: int
-    score_raw: float
-    amap_hw: np.ndarray
+    score_raw: float         # SSN pred_score (sigmoid) by default
+    amap_hw: np.ndarray      # SSN pred_map in crop-space (h,w), float32 [0,1]
     orig_rgb: np.ndarray
     gt_mask_orig: Optional[np.ndarray]
 
 
-class FastFlowInferenceEngine:
+class SSNInferenceEngine:
     def __init__(
         self,
         checkpoint_path: str,
         backbone: str,
-        flow_steps: int,
         image_size: Tuple[int, int],
-        hidden_ratio: float,
-        clamp: float,
-        conv3x3_only: bool,
+        perlin_threshold: float,
+        adapt_cls_features: bool,
+        layers: List[str],
+        pretrained_backbone: bool,
         device: str,
-        topk_ratio: float,
         crop_scale: float = 0.875,
     ):
         self.device = torch.device(device if (device == "cuda" and torch.cuda.is_available()) else "cpu")
         self.image_size = tuple(image_size)
-        self.topk_ratio = float(topk_ratio)
 
-        if backbone == "wide_resnet50_2":
-            self.model = FastFlowModel(
-                backbone_name=backbone,
-                flow_steps=flow_steps,
-                input_size=self.image_size,
-                hidden_ratio=hidden_ratio,
-                reducer_channels=(128, 192, 256),
-                clamp=clamp,
-                conv3x3_only=conv3x3_only,
-            )
-        else:
-            self.model = FastFlowModel(
-                backbone_name=backbone,
-                flow_steps=flow_steps,
-                input_size=self.image_size,
-                hidden_ratio=hidden_ratio,
-                clamp=clamp,
-                conv3x3_only=conv3x3_only,
-            )
+        # Build SSN model (must match training config)
+        self.model = SuperSimpleNetModel(
+            perlin_threshold=float(perlin_threshold),
+            backbone_name=backbone,
+            layers=list(layers),
+            stop_grad=True,  # anomalib default for unsupervised
+            adapt_cls_features=bool(adapt_cls_features),
+            input_size=self.image_size,
+            pretrained_backbone=bool(pretrained_backbone),
+        )
 
         ckpt = torch.load(checkpoint_path, map_location="cpu")
         state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
         self.model.load_state_dict(state, strict=True)
+
         self.model.to(self.device)
         self.model.eval()
 
+        # EXACT transform: Resize -> CenterCrop -> Normalize (torchvision v2)
         from torchvision.transforms import v2 as T
 
         h, w = self.image_size
@@ -415,32 +376,25 @@ class FastFlowInferenceEngine:
     def preprocess(self, image_path: str) -> Tuple[torch.Tensor, np.ndarray]:
         pil = Image.open(image_path).convert("RGB")
         orig_rgb = np.array(pil)
-        x = self.transform(pil).unsqueeze(0)
+        x = self.transform(pil).unsqueeze(0)  # [1,3,h,w]
         return x, orig_rgb
-
-    @torch.inference_mode()
-    def get_anomaly_map(self, x: torch.Tensor) -> torch.Tensor:
-        if hasattr(self.model, "get_anomaly_map"):
-            return self.model.get_anomaly_map(x)
-        out = self.model(x)
-        if not isinstance(out, torch.Tensor):
-            raise RuntimeError(f"Expected FastFlowModel to return torch.Tensor, got {type(out)}")
-        return out
 
     @torch.inference_mode()
     def infer_one(self, image_path: str) -> Tuple[float, np.ndarray, np.ndarray]:
         x, orig_rgb = self.preprocess(image_path)
         x = x.to(self.device)
 
-        amap = self.get_anomaly_map(x)                 # [1,1,h,w]
-        flat = amap.squeeze(1).flatten(1)              # [1, h*w]
-        k = max(1, int(self.topk_ratio * flat.shape[1]))
-        score = flat.topk(k, dim=1).values.mean(dim=1) # [1]
-        score_val = float(score.item())
-        amap_np = amap[0, 0].detach().cpu().numpy().astype(np.float32)
+        # SSN returns (pred_map, pred_score) in eval
+        pred_map, pred_score = self.model(x)  # pred_map [1,1,h,w], pred_score [1]
+        if not isinstance(pred_map, torch.Tensor) or not isinstance(pred_score, torch.Tensor):
+            raise RuntimeError("SSN model should return (pred_map, pred_score) tensors in eval mode.")
+
+        score_val = float(pred_score.reshape(-1)[0].item())
+        amap_np = pred_map[0, 0].detach().cpu().numpy().astype(np.float32)  # [0,1]
         return score_val, amap_np, orig_rgb
 
     def gt_mask_to_crop(self, gt_mask_orig: np.ndarray, orig_rgb: np.ndarray) -> np.ndarray:
+        """Convert original-size GT mask -> crop-space (h,w) mask aligned with anomaly map."""
         H0, W0 = orig_rgb.shape[:2]
         m = gt_mask_orig
         if m.shape[:2] != (H0, W0):
@@ -451,6 +405,7 @@ class FastFlowInferenceEngine:
         return ((m > 0).astype(np.uint8) * 255)
 
     def uncrop_mask_to_original(self, orig_rgb: np.ndarray, mask_hw: np.ndarray) -> np.ndarray:
+        """Put crop-space mask back into pre-resize canvas, then resize to original image size."""
         H0, W0 = orig_rgb.shape[:2]
         canvas = np.zeros((self.pre_h, self.pre_w), dtype=np.uint8)
         t, l = self.crop_top, self.crop_left
@@ -460,19 +415,14 @@ class FastFlowInferenceEngine:
     def save_contour_overlay(
         self,
         orig_rgb: np.ndarray,
-        anomaly_map_hw: np.ndarray,
+        anomaly_map_hw: np.ndarray,  # already [0,1]
         save_path: Path,
-        pixel_thr_norm: float,
-        global_min: float,
-        global_max: float,
+        pixel_thr: float,
         min_area: int,
         contour_thickness: int,
     ) -> int:
-        den = (float(global_max) - float(global_min)) + 1e-12
-        vis = (anomaly_map_hw - float(global_min)) / den
-        vis = np.clip(vis, 0.0, 1.0)
-
-        mask_hw = (vis >= float(pixel_thr_norm)).astype(np.uint8) * 255
+        vis = np.clip(anomaly_map_hw.astype(np.float32), 0.0, 1.0)
+        mask_hw = (vis >= float(pixel_thr)).astype(np.uint8) * 255
 
         kernel = np.ones((3, 3), np.uint8)
         mask_hw = cv2.morphologyEx(mask_hw, cv2.MORPH_OPEN, kernel, iterations=1)
@@ -492,10 +442,10 @@ class FastFlowInferenceEngine:
         return len(kept)
 
 
-class MVTecFastFlowEvaluator:
+class MVTecSSNEvaluator:
     def __init__(
         self,
-        engine: FastFlowInferenceEngine,
+        engine: SSNInferenceEngine,
         out_dir: Path,
         category: str,
         min_area: int,
@@ -507,12 +457,13 @@ class MVTecFastFlowEvaluator:
         backbone: str = "resnet18",
     ):
         self.engine = engine
-        self.out_dir = out_dir / category / backbone
+        self.out_dir = (out_dir / category / backbone)
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
         self.category = category
         self.min_area = int(min_area)
         self.thickness = int(thickness)
+
         self.fpr_limit = float(fpr_limit)
         self.aupro_downsample = max(1, int(aupro_downsample))
         self.save_mode = save_mode
@@ -522,9 +473,7 @@ class MVTecFastFlowEvaluator:
 
         self.direction: float = 1.0
         self.img_thr: float = 0.0
-        self.global_min: float = 0.0
-        self.global_max: float = 1.0
-        self.pix_thr_norm: float = 0.5
+        self.pix_thr: float = 0.5
 
         self.image_metrics = {}
         self.pixel_metrics = {}
@@ -554,6 +503,7 @@ class MVTecFastFlowEvaluator:
         y_true = np.array([s.gt_label for s in self.samples], dtype=np.int64)
         scores = np.array([s.score_raw for s in self.samples], dtype=np.float32)
 
+        # SSN scores should be higher=more anomalous, but keep auto-direction anyway
         n = scores[y_true == 0]
         a = scores[y_true == 1]
         self.direction = 1.0
@@ -586,10 +536,6 @@ class MVTecFastFlowEvaluator:
         return y_true, scores, eff_scores, y_pred
 
     def compute_pixel_metrics(self) -> None:
-        self.global_min = min(float(s.amap_hw.min()) for s in self.samples)
-        self.global_max = max(float(s.amap_hw.max()) for s in self.samples)
-        den = (self.global_max - self.global_min) + 1e-12
-
         ds = self.aupro_downsample
         aupro_metric = SelfAUPRO(fpr_limit=self.fpr_limit)
 
@@ -598,15 +544,14 @@ class MVTecFastFlowEvaluator:
         pix_labels_all = []
 
         for s in self.samples:
+            # SSN map already [0,1]
+            pred01 = np.clip(s.amap_hw.astype(np.float32), 0.0, 1.0)
+
             if s.gt_mask_orig is None:
-                gt_crop_255 = np.zeros_like(s.amap_hw, dtype=np.uint8)
+                gt_crop_255 = np.zeros_like(pred01, dtype=np.uint8)
             else:
                 gt_crop_255 = self.engine.gt_mask_to_crop(s.gt_mask_orig, s.orig_rgb)
-
-            gt01 = (gt_crop_255 > 0).astype(np.float32)  # {0,1}
-
-            pred01 = (s.amap_hw - self.global_min) / den
-            pred01 = np.clip(pred01, 0.0, 1.0).astype(np.float32)
+            gt01 = (gt_crop_255 > 0).astype(np.float32)
 
             # AUPRO update (downsample for memory)
             if ds > 1:
@@ -619,11 +564,11 @@ class MVTecFastFlowEvaluator:
                 gt_ds = gt01
 
             aupro_metric.update(
-                torch.from_numpy(pred_ds).unsqueeze(0),   # (1,H,W)
-                torch.from_numpy(gt_ds).unsqueeze(0),     # (1,H,W)
+                torch.from_numpy(pred_ds).unsqueeze(0),
+                torch.from_numpy(gt_ds).unsqueeze(0),
             )
 
-            # sampled pixels for AUROC + pix thr (cheap)
+            # sampled pixels for pixel-AUROC + pixel-threshold
             flat_pred = pred01.reshape(-1)
             flat_gt = gt01.reshape(-1).astype(np.int64)
             n = flat_pred.size
@@ -636,18 +581,16 @@ class MVTecFastFlowEvaluator:
         pix_labels_all = np.concatenate(pix_labels_all, axis=0)
 
         pix_auc = auroc_from_scores(pix_labels_all, pix_scores_all)
-        self.pix_thr_norm = f1adaptive_threshold_1d(pix_scores_all, pix_labels_all)
+        self.pix_thr = f1adaptive_threshold_1d(pix_scores_all, pix_labels_all)
 
-        pix_pred = (pix_scores_all > self.pix_thr_norm).astype(np.int64)
+        pix_pred = (pix_scores_all > self.pix_thr).astype(np.int64)
         tp, tn, fp, fn = confusion_counts(pix_labels_all, pix_pred)
         pix_prec = precision_from_counts(tp, fp)
 
         pixel_aupro = float(aupro_metric.compute().item())
 
         self.pixel_metrics = {
-            "global_min": self.global_min,
-            "global_max": self.global_max,
-            "pix_thr_norm": self.pix_thr_norm,
+            "pix_thr": self.pix_thr,
             "pixel_auroc_sampled": pix_auc,
             "pixel_precision_sampled": pix_prec,
             "pixel_aupro": pixel_aupro,
@@ -655,7 +598,7 @@ class MVTecFastFlowEvaluator:
             "fpr_limit": self.fpr_limit,
         }
 
-        print(f"[Pixel] pix_thr_norm={self.pix_thr_norm:.6f} (sampled)  global_min={self.global_min:.6f} global_max={self.global_max:.6f}")
+        print(f"[Pixel] pix_thr={self.pix_thr:.6f} (sampled)")
         print(f"[Pixel] AUROC:     {pix_auc:.6f} (sampled)")
         print(f"[Pixel] AUPRO@FPR<={self.fpr_limit:.2f}: {pixel_aupro:.6f} (downsample={ds}x)")
         print(f"[Pixel] Precision: {pix_prec*100:.2f}%  (TP={tp}, FP={fp}) (sampled)")
@@ -672,15 +615,10 @@ class MVTecFastFlowEvaluator:
             defect = defect_name_from_path(s.path)
             print(f"{idx:06d} | {s.path.name} | raw={s.score_raw:.6f} eff={eff_s:.6f} | True={gt} Pred={pred} | folder={defect}")
 
-            do_save = False
-            subdir = ""
-
             if self.save_mode == "pred":
-                do_save = (pred == 1)
-                subdir = "Pred1"
+                do_save, subdir = (pred == 1), "Pred1"
             elif self.save_mode == "tp":
-                do_save = (pred == 1 and gt == 1)
-                subdir = "TP"
+                do_save, subdir = (pred == 1 and gt == 1), "TP"
             elif self.save_mode == "all_pred":
                 do_save = (pred == 1)
                 subdir = "TP" if (pred == 1 and gt == 1) else "FP"
@@ -699,9 +637,7 @@ class MVTecFastFlowEvaluator:
                 orig_rgb=s.orig_rgb,
                 anomaly_map_hw=s.amap_hw,
                 save_path=save_path,
-                pixel_thr_norm=self.pix_thr_norm,
-                global_min=self.global_min,
-                global_max=self.global_max,
+                pixel_thr=self.pix_thr,
                 min_area=self.min_area,
                 contour_thickness=self.thickness,
             )
@@ -718,7 +654,7 @@ class MVTecFastFlowEvaluator:
 
     def run(self, paths: List[Path]) -> None:
         self.collect(paths)
-        y_true, scores, eff_scores, y_pred = self.compute_image_metrics()
+        _, _, eff_scores, y_pred = self.compute_image_metrics()
         self.compute_pixel_metrics()
         self.save_overlays(eff_scores, y_pred)
 
@@ -733,15 +669,16 @@ def main():
     parser.add_argument("--image_path", type=str, required=True)   # folder (MVTec test) or single image
     parser.add_argument("--category", type=str, required=True)
 
-    parser.add_argument("--backbone", type=str, default="resnet18")
-    parser.add_argument("--flow_steps", type=int, default=8)
-    parser.add_argument("--image_size", type=int, nargs=2, default=[416, 416])  # H W
-    parser.add_argument("--hidden_ratio", type=float, default=1.0)
-    parser.add_argument("--clamp", type=float, default=2.0)
-    parser.add_argument("--conv3x3_only", action="store_true")
-    parser.add_argument("--topk_ratio", type=float, default=0.01)
+    # SSN model args (must match training)
+    parser.add_argument("--backbone", type=str, default="resnet34", choices=["resnet18", "resnet34", "wide_resnet50_2"])
+    parser.add_argument("--layers", type=str, nargs="+", default=["layer2", "layer3"])
+    parser.add_argument("--perlin_threshold", type=float, default=0.2)
+    parser.add_argument("--adapt_cls_features", action="store_true")
+    parser.add_argument("--pretrained_backbone", action="store_true", default=True)
 
-    parser.add_argument("--save_dir", type=str, default="./inference_results")
+    parser.add_argument("--image_size", type=int, nargs=2, default=[416, 416])  # H W
+
+    parser.add_argument("--save_dir", type=str, default="./ssn_inference_results")
     parser.add_argument("--min_area", type=int, default=30)
     parser.add_argument("--thickness", type=int, default=2)
 
@@ -750,29 +687,25 @@ def main():
     parser.add_argument("--aupro_downsample", type=int, default=2, help="Downsample factor for AUPRO memory. 1=no downsample.")
     parser.add_argument("--pixel_sample_per_image", type=int, default=5000, help="Sample size per image for pixel AUROC/threshold (speed).")
 
-    # Save behavior:
-    # pred     => save all Pred=1 (TP+FP)
-    # tp       => save only TP
-    # all_pred => save Pred=1 into TP/ and FP/ folders
+    # Save behavior
     parser.add_argument("--save_mode", type=str, default="pred", choices=["pred", "tp", "all_pred"])
 
     parser.add_argument("--device", type=str, default="cuda")
 
     args = parser.parse_args()
 
-    engine = FastFlowInferenceEngine(
+    engine = SSNInferenceEngine(
         checkpoint_path=args.checkpoint_path,
         backbone=args.backbone,
-        flow_steps=args.flow_steps,
         image_size=tuple(args.image_size),
-        hidden_ratio=args.hidden_ratio,
-        clamp=args.clamp,
-        conv3x3_only=args.conv3x3_only,
+        perlin_threshold=args.perlin_threshold,
+        adapt_cls_features=args.adapt_cls_features,
+        layers=list(args.layers),
+        pretrained_backbone=bool(args.pretrained_backbone),
         device=args.device,
-        topk_ratio=args.topk_ratio,
     )
 
-    evaluator = MVTecFastFlowEvaluator(
+    evaluator = MVTecSSNEvaluator(
         engine=engine,
         out_dir=Path(args.save_dir),
         category=args.category,
@@ -782,7 +715,7 @@ def main():
         aupro_downsample=args.aupro_downsample,
         save_mode=args.save_mode,
         pixel_sample_per_image=args.pixel_sample_per_image,
-        backbone=args.backbone,
+        backbone=args.backbone
     )
 
     ip = Path(args.image_path)
