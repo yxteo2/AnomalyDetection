@@ -1,10 +1,9 @@
 import argparse
 from pathlib import Path
+import math
 
-import albumentations as A
 import numpy as np
 import torch
-from albumentations.pytorch import ToTensorV2
 from PIL import Image
 import cv2
 
@@ -12,13 +11,97 @@ from anomalib.metrics.threshold import F1AdaptiveThreshold
 from model import FastFlowModel
 
 
+# -----------------------------
+# MVTec GT mask loader
+# -----------------------------
+def load_gt_mask_mvtec(img_path: Path) -> np.ndarray | None:
+    """
+    For MVTec:
+      test/<defect>/xxx.png
+      ground_truth/<defect>/<stem>_mask.png
+    Returns: uint8 mask in ORIGINAL image size (H0,W0) with values {0,255}, or None if good/missing.
+    """
+    parts = list(img_path.parts)
+    lower = [p.lower() for p in parts]
+    if "test" not in lower:
+        return None
+
+    ti = lower.index("test")
+    if ti + 1 >= len(parts):
+        return None
+
+    defect = parts[ti + 1]
+    if defect.lower() == "good":
+        return None
+
+    cat_dir = img_path.parents[2]  # .../<category>
+    gt_path = cat_dir / "ground_truth" / defect / f"{img_path.stem}_mask.png"
+    if not gt_path.exists():
+        gt_path = cat_dir / "ground_truth" / defect / f"{img_path.stem}.png"
+        if not gt_path.exists():
+            return None
+
+    m = cv2.imread(str(gt_path), cv2.IMREAD_GRAYSCALE)
+    if m is None:
+        return None
+
+    m = ((m > 0).astype(np.uint8) * 255)
+    return m
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def iter_images_recursive(root: Path):
+    exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in exts:
+            continue
+        if "ground_truth" in {x.lower() for x in p.parts}:
+            continue
+        yield p
+
+
+def infer_gt_label_from_path(p: Path) -> int | None:
+    parts = [x.lower() for x in p.parts]
+    if "test" in parts:
+        i = parts.index("test")
+        if i + 1 < len(parts):
+            return 0 if parts[i + 1] == "good" else 1
+    return None
+
+
+def defect_name_from_path(p: Path) -> str:
+    parts = list(p.parts)
+    lower = [x.lower() for x in parts]
+    if "test" in lower:
+        i = lower.index("test")
+        if i + 1 < len(parts):
+            return parts[i + 1]
+    return p.parent.name
+
+
+def compute_f1_threshold_1d(scores_1d: np.ndarray, labels_1d: np.ndarray) -> float:
+    scores_t = torch.tensor(scores_1d, dtype=torch.float32)
+    labels_t = torch.tensor(labels_1d, dtype=torch.int64)
+    metric = F1AdaptiveThreshold()
+    metric.update(scores_t, labels_t)
+    thr = metric.compute()
+    return float(thr.item())
+
+
+# -----------------------------
+# Inference
+# -----------------------------
 class FastFlowInference:
     def __init__(
         self,
         checkpoint_path: str,
         backbone: str = "resnet18",
         flow_steps: int = 8,
-        image_size: tuple = (416, 416),  # (H, W)
+        image_size: tuple[int, int] = (416, 416),  # (H,W)
         hidden_ratio: float = 1.0,
         clamp: float = 2.0,
         conv3x3_only: bool = False,
@@ -29,13 +112,13 @@ class FastFlowInference:
         self.image_size = tuple(image_size)
         self.topk_ratio = float(topk_ratio)
 
-        if backbone == 'wide_resnet50_2':
+        if backbone == "wide_resnet50_2":
             self.model = FastFlowModel(
                 backbone_name=backbone,
                 flow_steps=flow_steps,
                 input_size=self.image_size,
                 hidden_ratio=hidden_ratio,
-                reducer_channels=(128, 192, 256),  # start here
+                reducer_channels=(128, 192, 256),
                 clamp=clamp,
                 conv3x3_only=conv3x3_only,
             )
@@ -49,27 +132,27 @@ class FastFlowInference:
                 conv3x3_only=conv3x3_only,
             )
 
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        state = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
         self.model.load_state_dict(state, strict=True)
-
         self.model.to(self.device)
         self.model.eval()
 
+        # EXACT transform: Resize -> CenterCrop -> Normalize
         from torchvision.transforms import v2 as T
 
-        import math
-        h, w = image_size
+        h, w = self.image_size
         crop_scale = 0.875
         pre_h = int(math.ceil(h / crop_scale))
-        pre_w = int(math.ceil(w / crop_scale))  
+        pre_w = int(math.ceil(w / crop_scale))
+
         self.h, self.w = h, w
         self.pre_h, self.pre_w = pre_h, pre_w
         self.crop_top = (pre_h - h) // 2
         self.crop_left = (pre_w - w) // 2
 
         self.transform = T.Compose([
-            T.ToImage(),                        # <-- important (PIL/np -> tensor image)
+            T.ToImage(),
             T.Resize((pre_h, pre_w), antialias=True),
             T.CenterCrop((h, w)),
             T.ToDtype(torch.float32, scale=True),
@@ -78,178 +161,115 @@ class FastFlowInference:
         ])
 
     def preprocess_image(self, image_path: str):
-        image_pil = Image.open(image_path).convert("RGB")
-        orig = np.array(image_pil)                 # keep for visualization (HWC RGB uint8)
-
-        x = self.transform(image_pil)              # <-- NO keyword args
-        x = x.unsqueeze(0)                         # [1,3,H,W]
-        return x, orig
+        pil = Image.open(image_path).convert("RGB")
+        orig_rgb = np.array(pil)  # original size (H0,W0,3)
+        x = self.transform(pil).unsqueeze(0)  # [1,3,h,w]
+        return x, orig_rgb
 
     @torch.inference_mode()
     def get_anomaly_map(self, x: torch.Tensor) -> torch.Tensor:
         if hasattr(self.model, "get_anomaly_map"):
             return self.model.get_anomaly_map(x)
-        return self.model(x)
+        return self.model(x)  # your model returns tensor [B,1,h,w]
 
-    @torch.inference_mode()
-    def score_only(self, image_path: str) -> float:
-        x, _ = self.preprocess_image(image_path)
-        x = x.to(self.device)
+    def gt_mask_to_crop(self, gt_mask_orig: np.ndarray, orig_rgb: np.ndarray) -> np.ndarray:
+        """
+        Convert ORIGINAL-size GT mask -> crop-space mask (h,w) matching anomaly_map.
+        """
+        H0, W0 = orig_rgb.shape[:2]
+        m = gt_mask_orig
 
-        amap = self.get_anomaly_map(x)             # [1,1,H,W]
-        flat = amap.squeeze(1).flatten(1)          # [1,HW]
-        k = max(1, int(self.topk_ratio * flat.shape[1]))
-        score = flat.topk(k, dim=1).values.mean(dim=1)
-        return float(score.item())
+        if m.shape[:2] != (H0, W0):
+            m = cv2.resize(m, (W0, H0), interpolation=cv2.INTER_NEAREST)
+
+        # resize to pre_h/pre_w
+        m = cv2.resize(m, (self.pre_w, self.pre_h), interpolation=cv2.INTER_NEAREST)
+
+        # center crop
+        t, l = self.crop_top, self.crop_left
+        m = m[t:t + self.h, l:l + self.w]
+
+        return ((m > 0).astype(np.uint8) * 255)
 
     def uncrop_mask_to_original(self, orig_rgb: np.ndarray, mask_hw: np.ndarray) -> np.ndarray:
         """
-        mask_hw: (h, w) uint8 binary (0/255) in crop-space.
-        Returns: uint8 binary mask aligned to original image size (H0,W0).
+        mask_hw: (h,w) uint8 {0,255} in crop-space.
+        Return: (H0,W0) uint8 {0,255} aligned to original.
         """
         H0, W0 = orig_rgb.shape[:2]
-
         canvas = np.zeros((self.pre_h, self.pre_w), dtype=np.uint8)
         t, l = self.crop_top, self.crop_left
         canvas[t:t + self.h, l:l + self.w] = mask_hw
-
-        # IMPORTANT: nearest-neighbor for masks
-        mask_orig = cv2.resize(canvas, (W0, H0), interpolation=cv2.INTER_NEAREST)
-        return mask_orig
+        return cv2.resize(canvas, (W0, H0), interpolation=cv2.INTER_NEAREST)
 
     @torch.inference_mode()
     def score_and_map(self, image_path: str):
-        x, orig = self.preprocess_image(image_path)
+        x, orig_rgb = self.preprocess_image(image_path)
         x = x.to(self.device)
 
-        amap = self.get_anomaly_map(x)  # [1,1,H,W]
-        flat = amap.squeeze(1).flatten(1)          # [1,HW]
+        amap = self.get_anomaly_map(x)  # [1,1,h,w]
+        flat = amap.squeeze(1).flatten(1)  # [1, h*w]
+
         k = max(1, int(self.topk_ratio * flat.shape[1]))
         score = flat.topk(k, dim=1).values.mean(dim=1)
+
         score_val = float(score.item())
+        amap_np = amap[0, 0].detach().cpu().numpy().astype(np.float32)  # (h,w)
+        return score_val, amap_np, orig_rgb
 
-        amap_np = amap[0, 0].detach().cpu().numpy().astype(np.float32)  # HxW (model size)
-        return score_val, amap_np, orig
-
-    @staticmethod
-    def _resize_map_to_orig(orig_rgb: np.ndarray, anomaly_map_hw: np.ndarray) -> np.ndarray:
-        H, W = orig_rgb.shape[:2]
-        if anomaly_map_hw.shape != (H, W):
-            anomaly_map_hw = cv2.resize(anomaly_map_hw, (W, H), interpolation=cv2.INTER_LINEAR)
-        return anomaly_map_hw
-
-    def save_contour_only(
+    def save_contour_overlay(
         self,
         orig_rgb: np.ndarray,
         anomaly_map_hw: np.ndarray,
         save_path: Path,
-        pixel_thr: float = 0.5,
+        pixel_thr_norm: float,
+        global_min: float,
+        global_max: float,
         min_area: int = 30,
         contour_thickness: int = 2,
     ):
         """
-        Save contour overlay (red contours) aligned correctly with your Resize+CenterCrop pipeline.
+        Normalize in crop-space using global min/max, threshold in crop-space,
+        uncrop to original, find contours, draw on original image.
         """
-
-
-        # 1) normalize + threshold in crop space
-        mn, mx = float(anomaly_map_hw.min()), float(anomaly_map_hw.max())
+        mn, mx = float(global_min), float(global_max)
         vis = (anomaly_map_hw - mn) / (mx - mn + 1e-12)
-        mask = (vis >= float(pixel_thr)).astype(np.uint8) * 255   # (h,w)
+        vis = np.clip(vis, 0.0, 1.0)
 
-        # 2) clean mask in crop space
+        mask_hw = (vis >= float(pixel_thr_norm)).astype(np.uint8) * 255
+
         kernel = np.ones((3, 3), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        mask_hw = cv2.morphologyEx(mask_hw, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask_hw = cv2.morphologyEx(mask_hw, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-        # 3) uncrop mask to original (NEAREST)
-        mask = self.uncrop_mask_to_original(orig_rgb, mask)
+        mask_orig = self.uncrop_mask_to_original(orig_rgb, mask_hw)
 
-        # 4) contours on original-aligned mask
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts, _ = cv2.findContours(mask_orig, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         kept = [c for c in cnts if cv2.contourArea(c) >= float(min_area)]
 
-        # 5) draw on original
         out_bgr = cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2BGR)
         if kept:
             cv2.drawContours(out_bgr, kept, -1, (0, 0, 255), int(contour_thickness))
 
+        save_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(save_path), out_bgr)
-
-
-def iter_images_recursive(root: Path):
-    """Recursively yields image files, skipping MVTec ground_truth masks."""
-    exts = {".png", ".jpg", ".jpeg", ".bmp"}
-    for p in root.rglob("*"):
-        if not p.is_file():
-            continue
-        if p.suffix.lower() not in exts:
-            continue
-        if "ground_truth" in {x.lower() for x in p.parts}:
-            continue
-        yield p
-
-
-def infer_gt_label_from_path(p: Path) -> int | None:
-    """MVTec: .../test/good/... => 0; .../test/<defect>/... => 1"""
-    parts = [x.lower() for x in p.parts]
-    if "test" in parts:
-        try:
-            i = parts.index("test")
-            if i + 1 < len(parts):
-                return 0 if parts[i + 1] == "good" else 1
-        except Exception:
-            pass
-    return None
-
-
-def defect_name_from_path(p: Path) -> str:
-    """
-    Defect name = folder right after 'test' (MVTec style).
-    If not found, fallback to parent folder name.
-    """
-    parts = list(p.parts)
-    lower = [x.lower() for x in parts]
-    if "test" in lower:
-        i = lower.index("test")
-        if i + 1 < len(parts):
-            return parts[i + 1]
-    return p.parent.name
-
-
-def compute_f1adaptive_threshold(scores: np.ndarray, labels: np.ndarray) -> float:
-    scores_t = torch.tensor(scores, dtype=torch.float32)
-    labels_t = torch.tensor(labels, dtype=torch.int64)
-    metric = F1AdaptiveThreshold()
-
-    try:
-        metric.update(scores_t, labels_t)
-        thr = metric.compute()
-        return float(thr.item() if hasattr(thr, "item") else thr)
-    except Exception:
-        thr = metric(scores_t, labels_t)
-        return float(thr.item() if hasattr(thr, "item") else thr)
 
 
 def main():
     parser = argparse.ArgumentParser()
-
     parser.add_argument("--checkpoint_path", type=str, required=True)
-    parser.add_argument("--image_path", type=str, required=True)   # folder (MVTec test) or single image
+    parser.add_argument("--image_path", type=str, required=True)
     parser.add_argument("--category", type=str, required=True)
 
     parser.add_argument("--backbone", type=str, default="resnet18")
     parser.add_argument("--flow_steps", type=int, default=8)
-    parser.add_argument("--image_size", type=int, nargs=2, default=[416, 416])  # H W
+    parser.add_argument("--image_size", type=int, nargs=2, default=[416, 416])
     parser.add_argument("--hidden_ratio", type=float, default=1.0)
     parser.add_argument("--clamp", type=float, default=2.0)
     parser.add_argument("--conv3x3_only", action="store_true")
     parser.add_argument("--topk_ratio", type=float, default=0.01)
 
     parser.add_argument("--save_dir", type=str, default="./inference_results")
-
-    # contour params
-    parser.add_argument("--pixel_thr", type=float, default=0.5)
     parser.add_argument("--min_area", type=int, default=30)
     parser.add_argument("--thickness", type=int, default=2)
 
@@ -268,58 +288,81 @@ def main():
     )
 
     ip = Path(args.image_path)
-    out_dir = Path(args.save_dir) / args.category
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     paths = list(iter_images_recursive(ip)) if ip.is_dir() else [ip]
-    if len(paths) == 0:
+    if not paths:
         print("Found 0 images.")
         return
 
-    # -------- Pass 1: collect scores + GT labels (needs MVTec test structure) --------
-    valid_paths, gt_labels, raw_scores = [], [], []
+    out_dir = Path(args.save_dir) / args.category
+    out_dir.mkdir(parents=True, exist_ok=True)
 
+    # -----------------------------
+    # Pass 1: collect image scores + maps + GT masks (for thresholds)
+    # -----------------------------
+    valid = []  # list of tuples: (path, gt_label, score, amap_hw, orig_rgb, gt_mask_orig)
     for p in paths:
         gt = infer_gt_label_from_path(p)
         if gt is None:
             continue
-        s = infer.score_only(str(p))
-        valid_paths.append(p)
-        gt_labels.append(gt)
-        raw_scores.append(s)
 
-    if len(valid_paths) == 0:
-        print("No images have inferable GT labels (expected MVTec: .../test/good or .../test/<defect>).")
+        score, amap_hw, orig_rgb = infer.score_and_map(str(p))
+        gt_mask_orig = load_gt_mask_mvtec(p)  # None for good
+
+        valid.append((p, gt, score, amap_hw, orig_rgb, gt_mask_orig))
+
+    if not valid:
+        print("No images have inferable GT labels.")
         return
 
-    raw_scores_np = np.asarray(raw_scores, dtype=np.float32)
-    labels_np = np.asarray(gt_labels, dtype=np.int64)
+    # image-level threshold
+    scores = np.array([v[2] for v in valid], dtype=np.float32)
+    labels = np.array([v[1] for v in valid], dtype=np.int64)
 
-    # -------- Auto-detect score direction --------
-    n = raw_scores_np[labels_np == 0]
-    a = raw_scores_np[labels_np == 1]
+    n = scores[labels == 0]
+    a = scores[labels == 1]
     direction = 1.0
-    if len(n) > 0 and len(a) > 0:
-        if float(a.mean()) < float(n.mean()):
-            direction = -1.0
-        print(f"Mean score normal: {float(n.mean()):.6f}")
-        print(f"Mean score anomaly: {float(a.mean()):.6f}")
-        print(f"Using direction = {direction:+.0f} (effective_score = direction * raw_score)")
-    eff_scores_np = raw_scores_np * direction
+    if len(n) and len(a) and float(a.mean()) < float(n.mean()):
+        direction = -1.0
+    eff_scores = scores * direction
+    img_thr = compute_f1_threshold_1d(eff_scores, labels)
+    print(f"[ImageThr] direction={direction:+.0f} img_thr={img_thr:.6f}")
 
-    threshold = compute_f1adaptive_threshold(eff_scores_np, labels_np)
-    pix_thr_metric = compute_f1adaptive_threshold(eff_scores_np, labels_np)
+    # global min/max across ALL anomaly maps (crop-space)
+    global_min = min(float(v[3].min()) for v in valid)
+    global_max = max(float(v[3].max()) for v in valid)
 
+    # pixel-level threshold from ALL pixels, normalized globally, using GT pixel labels in CROP SPACE
+    pixel_scores_all = []
+    pixel_labels_all = []
+    den = (global_max - global_min) + 1e-12
 
+    for (p, gt, score, amap_hw, orig_rgb, gt_mask_orig) in valid:
+        if gt_mask_orig is None:
+            gt_crop = np.zeros_like(amap_hw, dtype=np.uint8)
+        else:
+            gt_crop = infer.gt_mask_to_crop(gt_mask_orig, orig_rgb)
 
-    print(f"F1AdaptiveThreshold (effective score) = {threshold:.6f} (N={len(valid_paths)})")
+        pix_scores_norm = (amap_hw - global_min) / den
+        pix_scores_norm = np.clip(pix_scores_norm, 0.0, 1.0)
 
-    # -------- Pass 2: print all results, save ONLY predicted defect images (contour only) --------
+        pixel_scores_all.append(pix_scores_norm.reshape(-1).astype(np.float32))
+        pixel_labels_all.append((gt_crop.reshape(-1) > 0).astype(np.int64))
+
+    pixel_scores_all = np.concatenate(pixel_scores_all)
+    pixel_labels_all = np.concatenate(pixel_labels_all)
+
+    pix_thr_norm = compute_f1_threshold_1d(pixel_scores_all, pixel_labels_all)
+    print(f"[PixelThr] global_min={global_min:.6f} global_max={global_max:.6f} pix_thr_norm={pix_thr_norm:.6f}")
+
+    # -----------------------------
+    # Pass 2: evaluate + save contour overlays for predicted anomalies
+    # -----------------------------
     TP = TN = FP = FN = 0
     saved = 0
 
-    for idx, (p, gt, raw_s, eff_s) in enumerate(zip(valid_paths, gt_labels, raw_scores_np, eff_scores_np), 1):
-        pred = 1 if (eff_s > threshold) else 0
+    for idx, (p, gt, score, amap_hw, orig_rgb, gt_mask_orig) in enumerate(valid, 1):
+        eff_s = float(score) * direction
+        pred = 1 if eff_s > img_thr else 0
 
         if pred == 1 and gt == 1:
             TP += 1
@@ -330,35 +373,29 @@ def main():
         else:
             FN += 1
 
-        defect_name = defect_name_from_path(p)
-        print(
-            f"{idx:06d} | {p.name} | raw={float(raw_s):.6f} eff={float(eff_s):.6f} | "
-            f"True={gt} Pred={pred} | folder={defect_name}"
-        )
+        defect = defect_name_from_path(p)
+        print(f"{idx:06d} | {p.name} | raw={score:.6f} eff={eff_s:.6f} | True={gt} Pred={pred} | folder={defect}")
 
-        # ✅ only save predicted defect
         if pred == 0:
             continue
 
-        # compute map only when saving
-        score_val, amap, orig = infer.score_and_map(str(p))
-
-        save_name = f"TrueLabel_{gt}_Predicted_{pred}_{defect_name}_{p.name}"
+        save_name = f"True_{gt}_Pred_{pred}_{defect}_{p.name}"
         save_path = out_dir / save_name
 
-        infer.save_contour_only(
-            orig_rgb=orig,
-            anomaly_map_hw=amap,
+        infer.save_contour_overlay(
+            orig_rgb=orig_rgb,
+            anomaly_map_hw=amap_hw,
             save_path=save_path,
-            pixel_thr=0.5,
+            pixel_thr_norm=pix_thr_norm,
+            global_min=global_min,
+            global_max=global_max,
             min_area=args.min_area,
-            contour_thickness=args.thickness)
-
+            contour_thickness=args.thickness,
+        )
         saved += 1
 
     total = TP + TN + FP + FN
-    acc = (TP + TN) / total if total > 0 else 0.0
-
+    acc = (TP + TN) / total if total else 0.0
     print("\n=== Summary ===")
     print(f"Total: {total}")
     print(f"TP: {TP}  TN: {TN}  FP: {FP}  FN: {FN}")
