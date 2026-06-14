@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import tv_tensors
 from torchvision.transforms import v2 as T
 
@@ -345,6 +345,8 @@ class MVTecDataModule:
         train_transform=None,
         test_transform=None,
         dataset_type: str = "auto",
+        val_split: float = 0.1,
+        seed: int = 42,
     ):
         self.root_dir = root_dir
         self.category = category
@@ -354,8 +356,11 @@ class MVTecDataModule:
         self.train_transform = train_transform
         self.test_transform = test_transform
         self.dataset_type = dataset_type
+        self.val_split = float(val_split)
+        self.seed = int(seed)
 
-        self.train_dataset: Optional[MVTecDataset] = None
+        self.train_dataset = None
+        self.val_dataset = None
         self.test_dataset: Optional[MVTecDataset] = None
 
     def setup(self):
@@ -376,11 +381,45 @@ class MVTecDataModule:
             dataset_type=self.dataset_type,
         )
 
+        # Carve a normal-only validation split out of train/good so model
+        # selection never touches the test set. The validation view uses the
+        # deterministic (test) transform so its loss is comparable across epochs.
+        self.val_dataset = None
+        n = len(self.train_dataset)
+        if 0.0 < self.val_split < 1.0 and n > 1:
+            eval_view = MVTecDataset(
+                root_dir=self.root_dir,
+                category=self.category,
+                split="train",
+                image_size=self.image_size,
+                transform=self.test_transform,
+                dataset_type=self.dataset_type,
+            )
+            g = torch.Generator().manual_seed(self.seed)
+            perm = torch.randperm(n, generator=g).tolist()
+            n_val = max(1, int(round(n * self.val_split)))
+            val_idx = sorted(perm[:n_val])
+            train_idx = sorted(perm[n_val:])
+            self.val_dataset = Subset(eval_view, val_idx)
+            self.train_dataset = Subset(self.train_dataset, train_idx)
+            print(f"[Dataset] Split train/good into {len(train_idx)} train / {len(val_idx)} val")
+
     def train_dataloader(self) -> DataLoader:
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=True,
+        )
+
+    def val_dataloader(self) -> Optional[DataLoader]:
+        if self.val_dataset is None:
+            return None
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
         )

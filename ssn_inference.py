@@ -672,9 +672,9 @@ def main():
     # SSN model args (must match training)
     parser.add_argument("--backbone", type=str, default="resnet34", choices=["resnet18", "resnet34", "wide_resnet50_2"])
     parser.add_argument("--layers", type=str, nargs="+", default=["layer2", "layer3"])
-    parser.add_argument("--perlin_threshold", type=float, default=0.2)
+    parser.add_argument("--perlin_threshold", type=float, default=0.5)
     parser.add_argument("--adapt_cls_features", action="store_true")
-    parser.add_argument("--pretrained_backbone", action="store_true", default=True)
+    parser.add_argument("--pretrained_backbone", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--image_size", type=int, nargs=2, default=[416, 416])  # H W
 

@@ -125,7 +125,7 @@ class _PerlinLikeMask(nn.Module):
 class AnomalyGenerator(nn.Module):
     """Feature-level synthetic anomaly generator (train-time only)."""
 
-    def __init__(self, noise_mean: float = 0.0, noise_std: float = 0.015, threshold: float = 0.2, base_res: int = 4):
+    def __init__(self, noise_mean: float = 0.0, noise_std: float = 0.015, threshold: float = 0.5, base_res: int = 4):
         super().__init__()
         self.noise_mean = float(noise_mean)
         self.noise_std = float(noise_std)
@@ -238,7 +238,7 @@ class SuperSimpleNetModel(nn.Module):
 
     def __init__(
         self,
-        perlin_threshold: float = 0.2,
+        perlin_threshold: float = 0.5,
         backbone_name: str = "wide_resnet50_2",
         layers: Optional[List[str]] = None,
         stop_grad: bool = True,

@@ -204,11 +204,6 @@ class FastFlowModel(nn.Module):
         self.hidden_ratio = hidden_ratio
         self.clamp = clamp
 
-        self.feat_drop = nn.ModuleList([
-            nn.Dropout2d(p=0.2),  # try 0.05~0.2
-            nn.Dropout2d(p=0.2),
-            nn.Dropout2d(p=0.2),
-        ])
         self.backbone, backbone_channels, self.scales = self._build_backbone(backbone_name, input_size)
 
         # reducers (optional)
@@ -225,11 +220,16 @@ class FastFlowModel(nn.Module):
         # NOW build modules that depend on feature_channels
         self.context = nn.ModuleList([LocalConvContext(ch, k=3) for ch in self.feature_channels])
 
+        # Non-affine LayerNorm applied as the LAST op before each flow. Because it
+        # has no learnable scale and pins the per-feature variance, the trainable
+        # pre-flow blocks (reducers, context) can no longer drive the flow input to
+        # zero to cheat the negative log-likelihood (a collapse the loss can't see,
+        # since their Jacobian is not part of logdet).
         self.norms = nn.ModuleList()
         for ch, sc in zip(self.feature_channels, self.scales):
             h = int(input_size[0] / sc)
             w = int(input_size[1] / sc)
-            self.norms.append(nn.LayerNorm([ch, h, w], elementwise_affine=True))
+            self.norms.append(nn.LayerNorm([ch, h, w], elementwise_affine=False))
 
         # flows per feature level
         self.blocks = nn.ModuleList()
@@ -283,11 +283,9 @@ class FastFlowModel(nn.Module):
         if self.reducers is not None:
             feats = [self.reducers[i](feats[i]) for i in range(3)]
 
-        feats = [self.norms[i](feat) for i, feat in enumerate(feats)]
-
+        # learnable local mixing (novelty), then fixed-scale normalization last
         feats = [self.context[i](feat) for i, feat in enumerate(feats)]
-        if self.training:
-            feats = [self.feat_drop[i](feat) for i, feat in enumerate(feats)]
+        feats = [self.norms[i](feat) for i, feat in enumerate(feats)]
         return feats
 
     def forward(self, x: torch.Tensor):

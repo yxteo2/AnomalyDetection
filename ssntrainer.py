@@ -171,8 +171,8 @@ class SuperSimpleNetTrainer:
         model: nn.Module,
         device: str = "cuda",
         save_dir: str = "./checkpoints",
-        monitor: str = "image_auroc",
-        maximize: bool = True,
+        monitor: str = "val_loss",
+        maximize: bool = False,
         model_cfg: Optional[Dict[str, Any]] = None,  # store SSN init args for strict inference
     ):
         self.model = model.to(device)
@@ -306,7 +306,6 @@ class SuperSimpleNetTrainer:
             milestones=[int(num_epochs * 0.8), int(num_epochs * 0.9)],
             gamma=0.4,
         )
-        evaluator = SuperSimpleNetEvaluator(self.model, device=self.device)
 
         best = self.history["best_metric"]
         patience_counter = 0
@@ -318,43 +317,29 @@ class SuperSimpleNetTrainer:
             tr_loss = self.train_epoch(train_loader)
             self.history["train_loss"].append(tr_loss)
 
+            # Held-out normal images give a leakage-free selection signal: lower
+            # SSN loss on clean+synthetic-anomaly samples is better. Test AUROC is
+            # computed only once at the end (in evaluate()), never for selection.
             va_loss = self.validate_loss_on_normals(val_loader)
             self.history["val_loss"].append(va_loss)
 
-            if (epoch + 1) % eval_every == 0:
-                preds = evaluator.predict(val_loader)
-                metrics = evaluator.compute_metrics(preds)
+            print(f"Train Loss: {tr_loss:.4f} | Val Loss(normal): {va_loss:.4f}")
 
-                self.history["image_auroc"].append(metrics.get("image_auroc", float("nan")))
-                self.history["pixel_auroc"].append(metrics.get("pixel_auroc", float("nan")))
+            current = va_loss
+            improved = (current > best) if self.maximize else (current < best)
 
-                # Print richer metrics (THIS fixes your “metrics not printed / accuracy stagnant” issue)
-                print(
-                    f"Train Loss: {tr_loss:.4f} | Val Loss(normal): {va_loss:.4f}\n"
-                    f"[Image] AUROC: {metrics.get('image_auroc', float('nan')):.4f} | "
-                    f"Acc: {metrics.get('image_acc', float('nan'))*100:.2f}% | "
-                    f"Prec: {metrics.get('image_precision', float('nan'))*100:.2f}% | "
-                    f"Thr(F1): {metrics.get('image_thr', float('nan')):.4f}\n"
-                    f"[Pixel] AUROC: {metrics.get('pixel_auroc', float('nan')):.4f} | "
-                    f"Prec: {metrics.get('pixel_precision', float('nan'))*100:.2f}% | "
-                    f"Thr(F1): {metrics.get('pixel_thr', float('nan')):.4f}"
-                )
+            if np.isfinite(current) and improved:
+                best = current
+                self.history["best_metric"] = best
+                self.history["best_epoch"] = epoch + 1
 
-                current = metrics.get(self.monitor, float("nan"))
-                improved = (current > best) if self.maximize else (current < best)
+                self.save_checkpoint("best_model.pth", model_only=False)
+                self.save_checkpoint("best_model_state_dict.pth", model_only=True)
 
-                if np.isfinite(current) and improved:
-                    best = current
-                    self.history["best_metric"] = best
-                    self.history["best_epoch"] = epoch + 1
-
-                    self.save_checkpoint("best_model.pth", model_only=False)
-                    self.save_checkpoint("best_model_state_dict.pth", model_only=True)
-
-                    patience_counter = 0
-                    print(f"✓ New best model saved ({self.monitor}={best:.4f})")
-                else:
-                    patience_counter += 1
+                patience_counter = 0
+                print(f"✓ New best model saved (val_loss={best:.4f})")
+            else:
+                patience_counter += 1
 
             scheduler.step()
 

@@ -125,6 +125,7 @@ class AnomalyPipeline:
             image_size=(h, w),
             train_transform=train_tf,
             test_transform=test_tf,
+            val_split=float(self.cfg["val_split"]),
         )
         self.data_module.setup()
 
@@ -136,8 +137,8 @@ class AnomalyPipeline:
                 model=self.model,
                 device=str(self.device),
                 save_dir=str(self.save_dir),
-                monitor="image_auroc",
-                maximize=True,
+                monitor="val_loss",
+                maximize=False,
                 model_cfg={
                     "perlin_threshold": float(self.cfg["perlin_threshold"]),
                     "backbone_name": self.cfg["backbone"],
@@ -168,7 +169,12 @@ class AnomalyPipeline:
     def train(self):
         print("\n=== Starting Training ===")
         train_loader = self.data_module.train_dataloader()
-        val_loader = self.data_module.test_dataloader()
+
+        # Select checkpoints on a held-out normal split, never on the test set.
+        val_loader = self.data_module.val_dataloader()
+        if val_loader is None:
+            print("[Warn] No validation split available; falling back to test normals for monitoring.")
+            val_loader = self.data_module.test_dataloader()
 
         self.trainer.fit(
             train_loader=train_loader,
@@ -243,10 +249,10 @@ def parse_args():
     p.add_argument("--conv3x3_only", action="store_true")
 
     # ssn
-    p.add_argument("--perlin_threshold", type=float, default=0.2)
+    p.add_argument("--perlin_threshold", type=float, default=0.5)
     p.add_argument("--adapt_cls_features", action="store_true")
     p.add_argument("--layers", type=str, nargs="+", default=["layer2", "layer3"])
-    p.add_argument("--pretrained_backbone", action="store_true", default=True)
+    p.add_argument("--pretrained_backbone", action=argparse.BooleanOptionalAction, default=True)
 
     # training
     p.add_argument("--batch_size", type=int, default=32)
@@ -255,6 +261,8 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=1e-5)
     p.add_argument("--patience", type=int, default=30)
 
+    p.add_argument("--val_split", type=float, default=0.1,
+                   help="Fraction of train/good held out for leakage-free model selection.")
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--save_dir", type=str, default="./checkpoints")
     p.add_argument("--num_visualizations", type=int, default=10)
