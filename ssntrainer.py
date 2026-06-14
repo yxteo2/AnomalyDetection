@@ -240,32 +240,46 @@ class SuperSimpleNetTrainer:
     def validate_loss_on_normals(self, dataloader) -> float:
         """Compute SSN training loss but only on normal samples.
         Keep model.train() so anomaly generator runs (matches anomalib behavior).
+
+        The synthetic-anomaly injection is reseeded to a fixed value for the whole
+        pass so the validation loss is comparable across epochs; otherwise the
+        random Perlin masks/noise make val_loss jump and destabilize the
+        loss-based model selection / early stopping. The global RNG state is
+        saved and restored so training randomness is unaffected.
         """
         self.model.train()
         total = 0.0
         n = 0
 
-        for batch in tqdm(dataloader, desc="ValidationLoss(SSN,NormalOnly)"):
-            images = batch["image"].to(self.device)
-            labels = batch.get("label")
-            masks = batch.get("mask")
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        torch.manual_seed(12345)
+        try:
+            for batch in tqdm(dataloader, desc="ValidationLoss(SSN,NormalOnly)"):
+                images = batch["image"].to(self.device)
+                labels = batch.get("label")
+                masks = batch.get("mask")
 
-            if labels is not None:
-                labels = labels.to(self.device).view(-1)
-                keep = (labels == 0)
-                if not keep.any():
-                    continue
-                images = images[keep]
-                masks = masks.to(self.device)[keep] if masks is not None else None
-                labels = labels[keep]
-            else:
-                masks = masks.to(self.device) if masks is not None else None
+                if labels is not None:
+                    labels = labels.to(self.device).view(-1)
+                    keep = (labels == 0)
+                    if not keep.any():
+                        continue
+                    images = images[keep]
+                    masks = masks.to(self.device)[keep] if masks is not None else None
+                    labels = labels[keep]
+                else:
+                    masks = masks.to(self.device) if masks is not None else None
 
-            pred_map_logits, pred_score_logits, tgt_mask, tgt_label = self.model(images, masks=masks, labels=labels)
-            loss = self.loss_fn(pred_map_logits, pred_score_logits, tgt_mask, tgt_label)
+                pred_map_logits, pred_score_logits, tgt_mask, tgt_label = self.model(images, masks=masks, labels=labels)
+                loss = self.loss_fn(pred_map_logits, pred_score_logits, tgt_mask, tgt_label)
 
-            total += float(loss.item())
-            n += 1
+                total += float(loss.item())
+                n += 1
+        finally:
+            torch.set_rng_state(cpu_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_state)
 
         return total / max(1, n)
 
