@@ -68,21 +68,22 @@ def _f1adaptive_threshold(scores_1d: np.ndarray, labels_1d: np.ndarray) -> float
     return float(thr.item() if hasattr(thr, "item") else thr)
 
 
-def _auroc_direction_safe(y_true: np.ndarray, y_score: np.ndarray) -> float:
-    """Try AUROC(score) and AUROC(1-score), take max (safe for inverted scoring)."""
+def _auroc_fixed_orientation(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """AUROC with the model's fixed orientation (higher score => more anomalous).
+
+    We deliberately do NOT take max(auroc, 1-auroc): SSN's score/map orientation
+    is fixed by construction (sigmoid of the anomaly logit), so flipping would
+    silently report 1-auroc and hide an inverted or non-localizing map, inflating
+    the metric. Reporting the true value keeps the number honest and consistent
+    with the standalone inference script.
+    """
     y_true = y_true.astype(np.int64)
     if len(np.unique(y_true)) < 2:
         return float("nan")
-    s = y_score.astype(np.float64)
     try:
-        a1 = roc_auc_score(y_true, s)
+        return float(roc_auc_score(y_true, y_score.astype(np.float64)))
     except Exception:
-        a1 = float("nan")
-    try:
-        a2 = roc_auc_score(y_true, 1.0 - s)
-    except Exception:
-        a2 = float("nan")
-    return float(np.nanmax([a1, a2]))
+        return float("nan")
 
 
 def _binarize_mask_np(mask: np.ndarray) -> np.ndarray:
@@ -434,7 +435,7 @@ class SuperSimpleNetEvaluator:
             labels = labels.astype(np.int64)
             scores = scores.astype(np.float64)
 
-            metrics["image_auroc"] = _auroc_direction_safe(labels, scores)
+            metrics["image_auroc"] = _auroc_fixed_orientation(labels, scores)
 
             # F1AdaptiveThreshold-based metrics (no fixed 0.5!)
             img_thr = _f1adaptive_threshold(scores.astype(np.float32), labels)
@@ -465,7 +466,7 @@ class SuperSimpleNetEvaluator:
             pr = maps.astype(np.float32).reshape(-1)           # [0,1]
 
             if len(np.unique(gt)) >= 2:
-                metrics["pixel_auroc"] = _auroc_direction_safe(gt, pr)
+                metrics["pixel_auroc"] = _auroc_fixed_orientation(gt, pr)
 
                 px_thr = _f1adaptive_threshold(pr, gt)
                 px_pred = (pr > px_thr).astype(np.int64)
