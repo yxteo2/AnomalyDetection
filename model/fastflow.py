@@ -220,16 +220,17 @@ class FastFlowModel(nn.Module):
         # NOW build modules that depend on feature_channels
         self.context = nn.ModuleList([LocalConvContext(ch, k=3) for ch in self.feature_channels])
 
-        # Non-affine LayerNorm applied as the LAST op before each flow. Because it
-        # has no learnable scale and pins the per-feature variance, the trainable
+        # Fixed-scale normalization applied as the LAST op before each flow. With
+        # no learnable scale it pins the per-feature variance, so the trainable
         # pre-flow blocks (reducers, context) can no longer drive the flow input to
         # zero to cheat the negative log-likelihood (a collapse the loss can't see,
         # since their Jacobian is not part of logdet).
-        self.norms = nn.ModuleList()
-        for ch, sc in zip(self.feature_channels, self.scales):
-            h = int(input_size[0] / sc)
-            w = int(input_size[1] / sc)
-            self.norms.append(nn.LayerNorm([ch, h, w], elementwise_affine=False))
+        #
+        # GroupNorm(1, C) normalizes over (C,H,W) per sample — the same statistic
+        # as LayerNorm([C,H,W]) but independent of the exact spatial dims, so any
+        # input size works, not only sizes that divide evenly by the backbone
+        # strides (naive H/scale mismatched the ResNet's floor arithmetic).
+        self.norms = nn.ModuleList([nn.GroupNorm(1, ch, affine=False) for ch in self.feature_channels])
 
         # flows per feature level
         self.blocks = nn.ModuleList()
