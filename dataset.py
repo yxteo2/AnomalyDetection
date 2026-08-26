@@ -10,6 +10,17 @@ from torchvision import tv_tensors
 from torchvision.transforms import v2 as T
 
 IMG_GLOBS = ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif", "*.tiff", "*.webp")
+# Lowercased extension set for case-insensitive matching. VisA ships images with
+# uppercase .JPG, which lowercase glob patterns miss on case-sensitive filesystems.
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+
+
+def _list_images(directory: Path, recursive: bool = False) -> List[Path]:
+    """List image files by extension (case-insensitive), sorted."""
+    if not directory.exists():
+        return []
+    it = directory.rglob("*") if recursive else directory.iterdir()
+    return sorted(p for p in it if p.is_file() and p.suffix.lower() in IMG_EXTS)
 
 
 # ---------------------------------
@@ -35,12 +46,7 @@ def build_torchvision_transform(image_size: Tuple[int, int], split: str):
 # Helpers
 # ---------------------------------
 def _list_images_recursive(root: Path) -> List[Path]:
-    if not root.exists():
-        return []
-    out: List[Path] = []
-    for pat in IMG_GLOBS:
-        out.extend(root.rglob(pat))
-    return sorted(out)
+    return _list_images(root, recursive=True)
 
 
 def _is_mvtec_category_dir(category_dir: Path) -> bool:
@@ -273,7 +279,7 @@ class MVTecDataset(Dataset):
 
         if self.split == "train":
             train_dir = category_dir / "train" / "good"
-            self.image_paths = sorted([p for pat in IMG_GLOBS for p in train_dir.glob(pat)])
+            self.image_paths = _list_images(train_dir)
             self.labels = [0] * len(self.image_paths)
             self.mask_paths = [None] * len(self.image_paths)
 
@@ -282,14 +288,14 @@ class MVTecDataset(Dataset):
             mask_dir = category_dir / "ground_truth"
 
             good_dir = test_dir / "good"
-            good_images = sorted([p for pat in IMG_GLOBS for p in good_dir.glob(pat)])
+            good_images = _list_images(good_dir)
             self.image_paths.extend(good_images)
             self.labels.extend([0] * len(good_images))
             self.mask_paths.extend([None] * len(good_images))
 
             if test_dir.exists():
                 for defect_dir in sorted([d for d in test_dir.iterdir() if d.is_dir() and d.name != "good"]):
-                    defect_images = sorted([p for pat in IMG_GLOBS for p in defect_dir.glob(pat)])
+                    defect_images = _list_images(defect_dir)
                     for img_path in defect_images:
                         self.image_paths.append(img_path)
                         self.labels.append(1)
