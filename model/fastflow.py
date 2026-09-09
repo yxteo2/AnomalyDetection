@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 import torchvision.models as models
 
 
@@ -196,8 +196,14 @@ class FastFlowModel(nn.Module):
         conv3x3_only: bool = False,
         hidden_ratio: float = 1.0,
         clamp: float = 2.0,
+        pretrained_backbone: bool = True,
     ):
         super().__init__()
+        if input_size[0] % 16 != 0 or input_size[1] % 16 != 0:
+            raise ValueError(
+                "FastFlow input_size height and width must be divisible by 16 "
+                f"for fixed LayerNorm shapes, got {input_size}."
+            )
         self.input_size = input_size
         self.flow_steps = flow_steps
         self.conv3x3_only = conv3x3_only
@@ -209,7 +215,11 @@ class FastFlowModel(nn.Module):
             nn.Dropout2d(p=0.2),
             nn.Dropout2d(p=0.2),
         ])
-        self.backbone, backbone_channels, self.scales = self._build_backbone(backbone_name, input_size)
+        self.backbone, backbone_channels, self.scales = self._build_backbone(
+            backbone_name,
+            input_size,
+            pretrained=pretrained_backbone,
+        )
 
         # reducers (optional)
         self.reducers = None
@@ -245,15 +255,17 @@ class FastFlowModel(nn.Module):
 
         self.anomaly_map_generator = AnomalyMapGenerator(input_size=input_size)
 
-    def _build_backbone(self, name: str, input_size: Tuple[int, int]):
+    def _build_backbone(self, name: str, input_size: Tuple[int, int], pretrained: bool = True):
         if name == "resnet18":
-            net = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+            net = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None)
             channels = [64, 128, 256]   # layer1, layer2, layer3
         elif name == "resnet34":
-            net = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1)
+            net = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1 if pretrained else None)
             channels = [64, 128, 256]
         elif name == "wide_resnet50_2":
-            net = models.wide_resnet50_2(weights=models.Wide_ResNet50_2_Weights.IMAGENET1K_V1)
+            net = models.wide_resnet50_2(
+                weights=models.Wide_ResNet50_2_Weights.IMAGENET1K_V1 if pretrained else None
+            )
             channels = [256, 512, 1024]
         else:
             raise ValueError(f"Unsupported backbone: {name}")
@@ -290,7 +302,7 @@ class FastFlowModel(nn.Module):
             feats = [self.feat_drop[i](feat) for i, feat in enumerate(feats)]
         return feats
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, return_latents: Optional[bool] = None):
         # extract frozen features
         self.backbone.eval()
         features = self._extract_features(x)
@@ -307,8 +319,11 @@ class FastFlowModel(nn.Module):
             hidden_variables.append(z)
             jacobians.append(log_j)
 
-        # anomalib behavior:
-        if self.training:
+        # return_latents decouples the output contract from train/eval mode. This
+        # lets validation compute NLL with dropout disabled.
+        if return_latents is None:
+            return_latents = self.training
+        if return_latents:
             return hidden_variables, jacobians
 
-        return self.anomaly_map_generator(hidden_variables)  
+        return self.anomaly_map_generator(hidden_variables)

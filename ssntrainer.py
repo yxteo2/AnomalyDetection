@@ -1,10 +1,10 @@
 # ssntrainer.py
 # Updated anomalib-style SSN trainer/evaluator with:
 # - Stable truncation loss (applies on sigmoid(map_logits))
-# - Proper image Accuracy/Precision using F1AdaptiveThreshold (no fixed 0.5)
-# - Direction-safe AUROC (tries scores and 1-scores for image/pixel)
+# - Validation-loss checkpoint selection with an untouched test set
+# - Fixed anomaly-score direction (higher means more anomalous)
 # - Mask alignment safety (resizes masks to pred_map size with NEAREST)
-# - Optional pixel Precision (computed with F1AdaptiveThreshold on flattened pixels)
+# - Accuracy and precision from validation-calibrated fixed thresholds
 
 from __future__ import annotations
 
@@ -19,8 +19,6 @@ from sklearn.metrics import roc_auc_score
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import MultiStepLR
 from tqdm import tqdm
-
-from anomalib.metrics.threshold import F1AdaptiveThreshold
 
 # ---- focal loss (torchvision) ----
 try:
@@ -58,31 +56,15 @@ def _precision(tp: int, fp: int) -> float:
     return float(tp / (tp + fp + 1e-12))
 
 
-def _f1adaptive_threshold(scores_1d: np.ndarray, labels_1d: np.ndarray) -> float:
-    """F1AdaptiveThreshold for 1D scores/labels."""
-    scores_t = torch.tensor(scores_1d, dtype=torch.float32)
-    labels_t = torch.tensor(labels_1d, dtype=torch.int64)
-    metric = F1AdaptiveThreshold()
-    metric.update(scores_t, labels_t)
-    thr = metric.compute()
-    return float(thr.item() if hasattr(thr, "item") else thr)
-
-
-def _auroc_direction_safe(y_true: np.ndarray, y_score: np.ndarray) -> float:
-    """Try AUROC(score) and AUROC(1-score), take max (safe for inverted scoring)."""
+def _auroc(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """AUROC with the fixed contract that larger scores are more anomalous."""
     y_true = y_true.astype(np.int64)
     if len(np.unique(y_true)) < 2:
         return float("nan")
-    s = y_score.astype(np.float64)
     try:
-        a1 = roc_auc_score(y_true, s)
+        return float(roc_auc_score(y_true, y_score.astype(np.float64)))
     except Exception:
-        a1 = float("nan")
-    try:
-        a2 = roc_auc_score(y_true, 1.0 - s)
-    except Exception:
-        a2 = float("nan")
-    return float(np.nanmax([a1, a2]))
+        return float("nan")
 
 
 def _binarize_mask_np(mask: np.ndarray) -> np.ndarray:
@@ -171,8 +153,8 @@ class SuperSimpleNetTrainer:
         model: nn.Module,
         device: str = "cuda",
         save_dir: str = "./checkpoints",
-        monitor: str = "image_auroc",
-        maximize: bool = True,
+        monitor: str = "val_loss",
+        maximize: bool = False,
         model_cfg: Optional[Dict[str, Any]] = None,  # store SSN init args for strict inference
     ):
         self.model = model.to(device)
@@ -222,7 +204,12 @@ class SuperSimpleNetTrainer:
             masks = masks.to(self.device) if masks is not None else None
             labels = labels.to(self.device) if labels is not None else None
 
-            pred_map_logits, pred_score_logits, tgt_mask, tgt_label = self.model(images, masks=masks, labels=labels)
+            pred_map_logits, pred_score_logits, tgt_mask, tgt_label = self.model(
+                images,
+                masks=masks,
+                labels=labels,
+                generate_synthetic=True,
+            )
             loss = self.loss_fn(pred_map_logits, pred_score_logits, tgt_mask, tgt_label)
 
             self.optimizer.zero_grad(set_to_none=True)
@@ -239,9 +226,10 @@ class SuperSimpleNetTrainer:
     @torch.no_grad()
     def validate_loss_on_normals(self, dataloader) -> float:
         """Compute SSN training loss but only on normal samples.
-        Keep model.train() so anomaly generator runs (matches anomalib behavior).
+        Synthetic generation is requested explicitly while the model remains in
+        evaluation mode, preventing BatchNorm state updates from validation data.
         """
-        self.model.train()
+        self.model.eval()
         total = 0.0
         n = 0
 
@@ -261,7 +249,12 @@ class SuperSimpleNetTrainer:
             else:
                 masks = masks.to(self.device) if masks is not None else None
 
-            pred_map_logits, pred_score_logits, tgt_mask, tgt_label = self.model(images, masks=masks, labels=labels)
+            pred_map_logits, pred_score_logits, tgt_mask, tgt_label = self.model(
+                images,
+                masks=masks,
+                labels=labels,
+                generate_synthetic=True,
+            )
             loss = self.loss_fn(pred_map_logits, pred_score_logits, tgt_mask, tgt_label)
 
             total += float(loss.item())
@@ -306,8 +299,6 @@ class SuperSimpleNetTrainer:
             milestones=[int(num_epochs * 0.8), int(num_epochs * 0.9)],
             gamma=0.4,
         )
-        evaluator = SuperSimpleNetEvaluator(self.model, device=self.device)
-
         best = self.history["best_metric"]
         patience_counter = 0
 
@@ -322,25 +313,8 @@ class SuperSimpleNetTrainer:
             self.history["val_loss"].append(va_loss)
 
             if (epoch + 1) % eval_every == 0:
-                preds = evaluator.predict(val_loader)
-                metrics = evaluator.compute_metrics(preds)
-
-                self.history["image_auroc"].append(metrics.get("image_auroc", float("nan")))
-                self.history["pixel_auroc"].append(metrics.get("pixel_auroc", float("nan")))
-
-                # Print richer metrics (THIS fixes your “metrics not printed / accuracy stagnant” issue)
-                print(
-                    f"Train Loss: {tr_loss:.4f} | Val Loss(normal): {va_loss:.4f}\n"
-                    f"[Image] AUROC: {metrics.get('image_auroc', float('nan')):.4f} | "
-                    f"Acc: {metrics.get('image_acc', float('nan'))*100:.2f}% | "
-                    f"Prec: {metrics.get('image_precision', float('nan'))*100:.2f}% | "
-                    f"Thr(F1): {metrics.get('image_thr', float('nan')):.4f}\n"
-                    f"[Pixel] AUROC: {metrics.get('pixel_auroc', float('nan')):.4f} | "
-                    f"Prec: {metrics.get('pixel_precision', float('nan'))*100:.2f}% | "
-                    f"Thr(F1): {metrics.get('pixel_thr', float('nan')):.4f}"
-                )
-
-                current = metrics.get(self.monitor, float("nan"))
+                print(f"Train Loss: {tr_loss:.4f} | Val Loss(normal): {va_loss:.4f}")
+                current = va_loss
                 improved = (current > best) if self.maximize else (current < best)
 
                 if np.isfinite(current) and improved:
@@ -422,67 +396,70 @@ class SuperSimpleNetEvaluator:
             out["masks"] = torch.cat(all_masks, dim=0).numpy()  # (N,1,H,W)
         return out
 
-    def compute_metrics(self, preds: Dict) -> Dict[str, float]:
-        metrics: Dict[str, float] = {}
-
-        # -------------------------
-        # Image metrics
-        # -------------------------
+    def calibrate(
+        self,
+        preds: Dict,
+        image_quantile: float = 0.99,
+        pixel_quantile: float = 0.999,
+    ) -> Dict[str, float]:
+        """Fit fixed deployment thresholds on normal validation data."""
         labels = preds.get("labels")
-        scores = preds.get("scores")  # prob in [0,1]
+        if labels is None:
+            raise ValueError("Calibration requires validation labels.")
+        normal = labels.reshape(-1) == 0
+        if not normal.any():
+            raise ValueError("Calibration requires at least one normal validation image.")
+        return {
+            "image_threshold": float(np.quantile(preds["scores"][normal], image_quantile)),
+            "pixel_threshold": float(np.quantile(preds["maps"][normal], pixel_quantile)),
+            "image_quantile": float(image_quantile),
+            "pixel_quantile": float(pixel_quantile),
+        }
+
+    def compute_metrics(
+        self,
+        preds: Dict,
+        calibration: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, float]:
+        metrics: Dict[str, float] = {}
+        labels = preds.get("labels")
+        scores = preds.get("scores")
 
         if labels is not None and scores is not None and len(np.unique(labels)) >= 2:
             labels = labels.astype(np.int64)
             scores = scores.astype(np.float64)
-
-            metrics["image_auroc"] = _auroc_direction_safe(labels, scores)
-
-            # F1AdaptiveThreshold-based metrics (no fixed 0.5!)
-            img_thr = _f1adaptive_threshold(scores.astype(np.float32), labels)
-            y_pred = (scores > img_thr).astype(np.int64)
-
-            tp, tn, fp, fn = _confusion_counts(labels, y_pred)
-            metrics["image_thr"] = float(img_thr)
-            metrics["image_acc"] = _accuracy(tp, tn, fp, fn)
-            metrics["image_precision"] = _precision(tp, fp)
-            metrics["image_tp"] = float(tp)
-            metrics["image_fp"] = float(fp)
-            metrics["image_tn"] = float(tn)
-            metrics["image_fn"] = float(fn)
+            metrics["image_auroc"] = _auroc(labels, scores)
+            if calibration is not None:
+                img_thr = float(calibration["image_threshold"])
+                y_pred = (scores >= img_thr).astype(np.int64)
+                tp, tn, fp, fn = _confusion_counts(labels, y_pred)
+                metrics.update(
+                    {
+                        "image_threshold": img_thr,
+                        "image_accuracy": _accuracy(tp, tn, fp, fn),
+                        "image_precision": _precision(tp, fp),
+                        "image_tp": float(tp),
+                        "image_fp": float(fp),
+                        "image_tn": float(tn),
+                        "image_fn": float(fn),
+                    }
+                )
         else:
             metrics["image_auroc"] = float("nan")
-            metrics["image_thr"] = float("nan")
-            metrics["image_acc"] = float("nan")
-            metrics["image_precision"] = float("nan")
 
-        # -------------------------
-        # Pixel metrics
-        # -------------------------
-        masks = preds.get("masks")  # (N,1,H,W) maybe {0,1} or {0,255}
-        maps = preds.get("maps")    # (N,1,H,W) in [0,1] (SSN outputs sigmoid already)
-
+        masks = preds.get("masks")
+        maps = preds.get("maps")
         if masks is not None and maps is not None:
-            gt = _binarize_mask_np(masks).reshape(-1)          # {0,1}
-            pr = maps.astype(np.float32).reshape(-1)           # [0,1]
-
-            if len(np.unique(gt)) >= 2:
-                metrics["pixel_auroc"] = _auroc_direction_safe(gt, pr)
-
-                px_thr = _f1adaptive_threshold(pr, gt)
-                px_pred = (pr > px_thr).astype(np.int64)
-                tp, tn, fp, fn = _confusion_counts(gt, px_pred)
-
-                metrics["pixel_thr"] = float(px_thr)
+            gt = _binarize_mask_np(masks).reshape(-1)
+            pr = maps.astype(np.float32).reshape(-1)
+            metrics["pixel_auroc"] = _auroc(gt, pr) if len(np.unique(gt)) >= 2 else float("nan")
+            if calibration is not None:
+                px_thr = float(calibration["pixel_threshold"])
+                px_pred = (pr >= px_thr).astype(np.int64)
+                tp, _, fp, _ = _confusion_counts(gt, px_pred)
+                metrics["pixel_threshold"] = px_thr
                 metrics["pixel_precision"] = _precision(tp, fp)
-                metrics["pixel_tp"] = float(tp)
-                metrics["pixel_fp"] = float(fp)
-            else:
-                metrics["pixel_auroc"] = float("nan")
-                metrics["pixel_thr"] = float("nan")
-                metrics["pixel_precision"] = float("nan")
         else:
             metrics["pixel_auroc"] = float("nan")
-            metrics["pixel_thr"] = float("nan")
-            metrics["pixel_precision"] = float("nan")
 
         return metrics

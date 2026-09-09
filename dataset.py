@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import tv_tensors
 from torchvision.transforms import v2 as T
 
@@ -345,6 +345,8 @@ class MVTecDataModule:
         train_transform=None,
         test_transform=None,
         dataset_type: str = "auto",
+        val_ratio: float = 0.2,
+        seed: int = 42,
     ):
         self.root_dir = root_dir
         self.category = category
@@ -354,12 +356,17 @@ class MVTecDataModule:
         self.train_transform = train_transform
         self.test_transform = test_transform
         self.dataset_type = dataset_type
+        if not 0.0 < val_ratio < 1.0:
+            raise ValueError(f"val_ratio must be between 0 and 1, got {val_ratio}")
+        self.val_ratio = float(val_ratio)
+        self.seed = int(seed)
 
-        self.train_dataset: Optional[MVTecDataset] = None
+        self.train_dataset = None
+        self.val_dataset = None
         self.test_dataset: Optional[MVTecDataset] = None
 
     def setup(self):
-        self.train_dataset = MVTecDataset(
+        train_augmented = MVTecDataset(
             root_dir=self.root_dir,
             category=self.category,
             split="train",
@@ -367,6 +374,31 @@ class MVTecDataModule:
             transform=self.train_transform,
             dataset_type=self.dataset_type,
         )
+        train_deterministic = MVTecDataset(
+            root_dir=self.root_dir,
+            category=self.category,
+            split="train",
+            image_size=self.image_size,
+            transform=self.test_transform,
+            dataset_type=self.dataset_type,
+        )
+
+        n_samples = len(train_augmented)
+        if n_samples < 2:
+            raise ValueError(
+                f"Need at least two normal training images to create a validation split, got {n_samples}."
+            )
+
+        generator = torch.Generator().manual_seed(self.seed)
+        indices = torch.randperm(n_samples, generator=generator).tolist()
+        n_val = min(n_samples - 1, max(1, int(round(n_samples * self.val_ratio))))
+        val_indices = indices[:n_val]
+        train_indices = indices[n_val:]
+
+        # Separate dataset instances keep augmentation confined to training while
+        # validation uses the same deterministic preprocessing as testing.
+        self.train_dataset = Subset(train_augmented, train_indices)
+        self.val_dataset = Subset(train_deterministic, val_indices)
         self.test_dataset = MVTecDataset(
             root_dir=self.root_dir,
             category=self.category,
@@ -374,6 +406,10 @@ class MVTecDataModule:
             image_size=self.image_size,
             transform=self.test_transform,
             dataset_type=self.dataset_type,
+        )
+        print(
+            f"[Dataset] normal split: train={len(self.train_dataset)}, "
+            f"validation={len(self.val_dataset)}, test={len(self.test_dataset)}"
         )
 
     def train_dataloader(self) -> DataLoader:
@@ -388,6 +424,15 @@ class MVTecDataModule:
     def test_dataloader(self) -> DataLoader:
         return DataLoader(
             self.test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True,
+        )
+
+    def val_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,

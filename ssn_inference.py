@@ -1,11 +1,12 @@
 # ssn_inference.py
 # OOP SuperSimpleNet (SSN) inference for MVTec:
 # - exact Resize->CenterCrop preprocessing (torchvision v2)
-# - image-level: Accuracy, Precision, AUROC + F1AdaptiveThreshold for image threshold (auto direction)
+# - image-level: Accuracy, Precision and AUROC with validation-calibrated thresholds
 # - pixel-level: AUROC (sampled) + SELF-IMPLEMENTED AUPRO (region overlap) on anomaly maps
 # - contour overlay drawn on ORIGINAL image, but thresholding done in crop-space then "uncropped" back
 
 import argparse
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,7 +17,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-from anomalib.metrics.threshold import F1AdaptiveThreshold
 from model import SuperSimpleNetModel  # uses your SSN implementation
 
 
@@ -236,13 +236,25 @@ def auroc_from_scores(y_true: np.ndarray, y_score: np.ndarray) -> float:
     return float(auc)
 
 
-def f1adaptive_threshold_1d(scores: np.ndarray, labels: np.ndarray) -> float:
-    scores_t = torch.tensor(scores, dtype=torch.float32)
-    labels_t = torch.tensor(labels, dtype=torch.int64)
-    metric = F1AdaptiveThreshold()
-    metric.update(scores_t, labels_t)
-    thr = metric.compute()
-    return float(thr.item() if hasattr(thr, "item") else thr)
+def load_calibration(checkpoint_path: str, calibration_path: Optional[str]) -> dict:
+    candidates = []
+    if calibration_path:
+        candidates.append(Path(calibration_path))
+    checkpoint = Path(checkpoint_path)
+    candidates.extend(
+        [checkpoint.parent / "calibration.json", checkpoint.parent.parent / "calibration.json"]
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            with candidate.open("r", encoding="utf-8") as f:
+                calibration = json.load(f)
+            if "image_threshold" not in calibration or "pixel_threshold" not in calibration:
+                raise ValueError(f"Invalid calibration file: {candidate}")
+            print(f"Loaded calibration: {candidate}")
+            return calibration
+    raise FileNotFoundError(
+        "No calibration.json found. Run train.py with the updated pipeline or pass --calibration_path."
+    )
 
 
 # -----------------------------
@@ -312,7 +324,7 @@ def load_gt_mask_mvtec(img_path: Path) -> Optional[np.ndarray]:
 @dataclass
 class Sample:
     path: Path
-    gt_label: int
+    gt_label: Optional[int]
     score_raw: float         # SSN pred_score (sigmoid) by default
     amap_hw: np.ndarray      # SSN pred_map in crop-space (h,w), float32 [0,1]
     orig_rgb: np.ndarray
@@ -333,7 +345,17 @@ class SSNInferenceEngine:
         crop_scale: float = 0.875,
     ):
         self.device = torch.device(device if (device == "cuda" and torch.cuda.is_available()) else "cpu")
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        model_cfg = ckpt.get("model_cfg", {}) if isinstance(ckpt, dict) else {}
+        backbone = model_cfg.get("backbone_name", backbone)
+        image_size = tuple(model_cfg.get("input_size", image_size))
+        perlin_threshold = float(model_cfg.get("perlin_threshold", perlin_threshold))
+        adapt_cls_features = bool(model_cfg.get("adapt_cls_features", adapt_cls_features))
+        layers = list(model_cfg.get("layers", layers))
+        pretrained_backbone = bool(model_cfg.get("pretrained_backbone", pretrained_backbone))
+        crop_scale = float(model_cfg.get("crop_scale", crop_scale))
         self.image_size = tuple(image_size)
+        self.backbone = backbone
 
         # Build SSN model (must match training config)
         self.model = SuperSimpleNetModel(
@@ -343,10 +365,10 @@ class SSNInferenceEngine:
             stop_grad=True,  # anomalib default for unsupervised
             adapt_cls_features=bool(adapt_cls_features),
             input_size=self.image_size,
-            pretrained_backbone=bool(pretrained_backbone),
+            # The checkpoint includes the frozen backbone weights.
+            pretrained_backbone=False,
         )
 
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
         state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
         self.model.load_state_dict(state, strict=True)
 
@@ -455,6 +477,7 @@ class MVTecSSNEvaluator:
         save_mode: str,
         pixel_sample_per_image: int = 5000,
         backbone: str = "resnet18",
+        calibration: Optional[dict] = None,
     ):
         self.engine = engine
         self.out_dir = (out_dir / category / backbone)
@@ -468,12 +491,12 @@ class MVTecSSNEvaluator:
         self.aupro_downsample = max(1, int(aupro_downsample))
         self.save_mode = save_mode
         self.pixel_sample_per_image = int(pixel_sample_per_image)
+        self.calibration = calibration or {}
 
         self.samples: List[Sample] = []
 
-        self.direction: float = 1.0
-        self.img_thr: float = 0.0
-        self.pix_thr: float = 0.5
+        self.img_thr: float = float(self.calibration.get("image_threshold", 0.0))
+        self.pix_thr: float = float(self.calibration.get("pixel_threshold", 0.5))
 
         self.image_metrics = {}
         self.pixel_metrics = {}
@@ -482,14 +505,12 @@ class MVTecSSNEvaluator:
         self.samples.clear()
         for p in paths:
             gt = infer_gt_label_from_path(p)
-            if gt is None:
-                continue
             score, amap_hw, orig_rgb = self.engine.infer_one(str(p))
             gt_mask_orig = load_gt_mask_mvtec(p)
             self.samples.append(
                 Sample(
                     path=p,
-                    gt_label=int(gt),
+                    gt_label=int(gt) if gt is not None else None,
                     score_raw=float(score),
                     amap_hw=amap_hw,
                     orig_rgb=orig_rgb,
@@ -497,41 +518,33 @@ class MVTecSSNEvaluator:
                 )
             )
         if not self.samples:
-            raise RuntimeError("No images have inferable GT labels. Expected MVTec test structure.")
+            raise RuntimeError("No readable images were collected.")
 
     def compute_image_metrics(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        y_true = np.array([s.gt_label for s in self.samples], dtype=np.int64)
+        y_true = np.array([s.gt_label if s.gt_label is not None else -1 for s in self.samples], dtype=np.int64)
         scores = np.array([s.score_raw for s in self.samples], dtype=np.float32)
 
-        # SSN scores should be higher=more anomalous, but keep auto-direction anyway
-        n = scores[y_true == 0]
-        a = scores[y_true == 1]
-        self.direction = 1.0
-        if len(n) and len(a) and float(a.mean()) < float(n.mean()):
-            self.direction = -1.0
-
-        eff_scores = scores * self.direction
-        self.img_thr = f1adaptive_threshold_1d(eff_scores, y_true)
-
-        y_pred = (eff_scores > self.img_thr).astype(np.int64)
-        tp, tn, fp, fn = confusion_counts(y_true, y_pred)
-        acc = accuracy_from_counts(tp, tn, fp, fn)
-        prec = precision_from_counts(tp, fp)
-        auc = auroc_from_scores(y_true, eff_scores)
+        eff_scores = scores
+        y_pred = (eff_scores >= self.img_thr).astype(np.int64)
+        labeled = y_true >= 0
+        tp, tn, fp, fn = confusion_counts(y_true[labeled], y_pred[labeled]) if labeled.any() else (0, 0, 0, 0)
+        acc = accuracy_from_counts(tp, tn, fp, fn) if labeled.any() else float("nan")
+        prec = precision_from_counts(tp, fp) if labeled.any() else float("nan")
+        auc = auroc_from_scores(y_true[labeled], eff_scores[labeled]) if labeled.any() else float("nan")
 
         self.image_metrics = {
             "tp": tp, "tn": tn, "fp": fp, "fn": fn,
             "accuracy": acc,
             "precision": prec,
             "auroc": auc,
-            "direction": self.direction,
             "threshold": self.img_thr,
         }
 
-        print(f"[Image] direction={self.direction:+.0f}  img_thr={self.img_thr:.6f}")
-        print(f"[Image] Accuracy:  {acc*100:.2f}%")
-        print(f"[Image] Precision: {prec*100:.2f}%  (TP={tp}, FP={fp}, TN={tn}, FN={fn})")
-        print(f"[Image] AUROC:     {auc:.6f}")
+        print(f"[Image] fixed validation threshold={self.img_thr:.6f}")
+        if labeled.any():
+            print(f"[Image] Accuracy:  {acc*100:.2f}%")
+            print(f"[Image] Precision: {prec*100:.2f}%  (TP={tp}, FP={fp}, TN={tn}, FN={fn})")
+            print(f"[Image] AUROC:     {auc:.6f}")
 
         return y_true, scores, eff_scores, y_pred
 
@@ -581,9 +594,7 @@ class MVTecSSNEvaluator:
         pix_labels_all = np.concatenate(pix_labels_all, axis=0)
 
         pix_auc = auroc_from_scores(pix_labels_all, pix_scores_all)
-        self.pix_thr = f1adaptive_threshold_1d(pix_scores_all, pix_labels_all)
-
-        pix_pred = (pix_scores_all > self.pix_thr).astype(np.int64)
+        pix_pred = (pix_scores_all >= self.pix_thr).astype(np.int64)
         tp, tn, fp, fn = confusion_counts(pix_labels_all, pix_pred)
         pix_prec = precision_from_counts(tp, fp)
 
@@ -598,7 +609,7 @@ class MVTecSSNEvaluator:
             "fpr_limit": self.fpr_limit,
         }
 
-        print(f"[Pixel] pix_thr={self.pix_thr:.6f} (sampled)")
+        print(f"[Pixel] fixed validation threshold={self.pix_thr:.6f}")
         print(f"[Pixel] AUROC:     {pix_auc:.6f} (sampled)")
         print(f"[Pixel] AUPRO@FPR<={self.fpr_limit:.2f}: {pixel_aupro:.6f} (downsample={ds}x)")
         print(f"[Pixel] Precision: {pix_prec*100:.2f}%  (TP={tp}, FP={fp}) (sampled)")
@@ -609,7 +620,7 @@ class MVTecSSNEvaluator:
 
         for idx, s in enumerate(self.samples, 1):
             pred = int(y_pred[idx - 1])
-            gt = int(s.gt_label)
+            gt = int(s.gt_label) if s.gt_label is not None else -1
             eff_s = float(eff_scores[idx - 1])
 
             defect = defect_name_from_path(s.path)
@@ -655,7 +666,10 @@ class MVTecSSNEvaluator:
     def run(self, paths: List[Path]) -> None:
         self.collect(paths)
         _, _, eff_scores, y_pred = self.compute_image_metrics()
-        self.compute_pixel_metrics()
+        if any(sample.gt_label is not None for sample in self.samples):
+            self.compute_pixel_metrics()
+        else:
+            print("[Metrics] Unlabeled input: dataset metrics skipped.")
         self.save_overlays(eff_scores, y_pred)
 
 
@@ -666,15 +680,16 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--checkpoint_path", type=str, required=True)
+    parser.add_argument("--calibration_path", type=str, default=None)
     parser.add_argument("--image_path", type=str, required=True)   # folder (MVTec test) or single image
     parser.add_argument("--category", type=str, required=True)
 
     # SSN model args (must match training)
-    parser.add_argument("--backbone", type=str, default="resnet34", choices=["resnet18", "resnet34", "wide_resnet50_2"])
+    parser.add_argument("--backbone", type=str, default="resnet18", choices=["resnet18", "resnet34", "wide_resnet50_2"])
     parser.add_argument("--layers", type=str, nargs="+", default=["layer2", "layer3"])
     parser.add_argument("--perlin_threshold", type=float, default=0.2)
     parser.add_argument("--adapt_cls_features", action="store_true")
-    parser.add_argument("--pretrained_backbone", action="store_true", default=True)
+    parser.add_argument("--pretrained_backbone", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--image_size", type=int, nargs=2, default=[416, 416])  # H W
 
@@ -693,6 +708,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
 
     args = parser.parse_args()
+    calibration = load_calibration(args.checkpoint_path, args.calibration_path)
 
     engine = SSNInferenceEngine(
         checkpoint_path=args.checkpoint_path,
@@ -715,7 +731,8 @@ def main():
         aupro_downsample=args.aupro_downsample,
         save_mode=args.save_mode,
         pixel_sample_per_image=args.pixel_sample_per_image,
-        backbone=args.backbone
+        backbone=engine.backbone,
+        calibration=calibration,
     )
 
     ip = Path(args.image_path)

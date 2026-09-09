@@ -1,6 +1,6 @@
 # trainer.py
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -23,18 +23,20 @@ class FastFlowTrainer:
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-5,
         save_dir: str = "./checkpoints",
-        monitor: str = "image_auroc",   # or "pixel_auroc"
-        maximize: bool = True,          # AUROC higher is better
+        monitor: str = "val_loss",
+        maximize: bool = False,
+        model_cfg: Optional[Dict[str, Any]] = None,
     ):
         self.model = model.to(device)
         self.device = device
         self.backbone_name = backbone_name
 
-        self.save_dir = Path(save_dir) / self.model.__class__.__name__ / self.backbone_name
+        self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
         self.monitor = monitor
         self.maximize = maximize
+        self.model_cfg = model_cfg or {}
 
         self.optimizer = Adam(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
@@ -83,7 +85,7 @@ class FastFlowTrainer:
         Compute FastFlow loss but ONLY on normal samples if labels exist.
         This makes val_loss meaningful even if you pass test_dataloader (mixed).
         """
-        self.model.train()  # keep train=True so forward returns (hidden,jac)
+        self.model.eval()
         total_loss = 0.0
         num_batches = 0
 
@@ -98,7 +100,7 @@ class FastFlowTrainer:
                     continue
                 images = images[normal_mask]
 
-            hidden_vars, jacobians = self.model(images)
+            hidden_vars, jacobians = self.model(images, return_latents=True)
             loss = self._fastflow_loss(hidden_vars, jacobians)
 
             total_loss += float(loss.item())
@@ -119,8 +121,6 @@ class FastFlowTrainer:
         best_metric = self.history["best_metric"]
         patience_counter = 0
 
-        evaluator = FastFlowEvaluator(self.model, device=self.device)
-
         for epoch in range(num_epochs):
             self.history["epoch"] = epoch + 1
             print(f"\nEpoch {epoch + 1}/{num_epochs}")
@@ -133,21 +133,8 @@ class FastFlowTrainer:
             self.history["val_loss"].append(val_loss)
 
             if (epoch + 1) % eval_every == 0:
-                preds = evaluator.predict(val_loader)
-                metrics = evaluator.compute_metrics(preds)
-
-                img_auc = metrics["image_auroc"]
-                px_auc = metrics["pixel_auroc"]
-
-                self.history["image_auroc"].append(img_auc)
-                self.history["pixel_auroc"].append(px_auc)
-
-                print(
-                    f"Train Loss: {train_loss:.4f} | Val Loss(normal): {val_loss:.4f} | "
-                    f"Val Image-AUROC: {img_auc:.4f} | Val Pixel-AUROC: {px_auc:.4f}"
-                )
-
-                current = metrics[self.monitor]
+                print(f"Train Loss: {train_loss:.4f} | Val Loss(normal): {val_loss:.4f}")
+                current = val_loss
                 improved = (current > best_metric) if self.maximize else (current < best_metric)
 
                 if improved:
@@ -161,7 +148,6 @@ class FastFlowTrainer:
                     patience_counter += 1
             else:
                 print(f"Train Loss: {train_loss:.4f} | Val Loss(normal): {val_loss:.4f}")
-                patience_counter += 1
 
             scheduler.step()
 
@@ -184,6 +170,7 @@ class FastFlowTrainer:
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "history": self.history,
+            "model_cfg": self.model_cfg,
         }
         torch.save(checkpoint, self.save_dir / filename)
 
@@ -193,6 +180,7 @@ class FastFlowTrainer:
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.history = checkpoint["history"]
+        self.model_cfg = checkpoint.get("model_cfg", self.model_cfg)
         print(f"Checkpoint loaded from {path}")
 
     def plot_history(self):
@@ -279,7 +267,29 @@ class FastFlowEvaluator:
             "anomaly_maps": np.concatenate(all_maps, axis=0),
         }
 
-    def compute_metrics(self, predictions: Dict[str, np.ndarray]) -> Dict[str, float]:
+    def calibrate(
+        self,
+        predictions: Dict[str, np.ndarray],
+        image_quantile: float = 0.99,
+        pixel_quantile: float = 0.999,
+    ) -> Dict[str, float]:
+        """Fit deployment thresholds using normal validation samples only."""
+        labels = predictions["labels"].reshape(-1)
+        normal = labels == 0
+        if not normal.any():
+            raise ValueError("Calibration requires at least one normal validation image.")
+        return {
+            "image_threshold": float(np.quantile(predictions["scores"][normal], image_quantile)),
+            "pixel_threshold": float(np.quantile(predictions["anomaly_maps"][normal], pixel_quantile)),
+            "image_quantile": float(image_quantile),
+            "pixel_quantile": float(pixel_quantile),
+        }
+
+    def compute_metrics(
+        self,
+        predictions: Dict[str, np.ndarray],
+        calibration: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, float]:
         scores = predictions["scores"]
         labels = predictions["labels"]
         masks = predictions["masks"]
@@ -287,15 +297,29 @@ class FastFlowEvaluator:
 
         image_auroc = roc_auc_score(labels, scores) if len(np.unique(labels)) > 1 else 0.0
 
-        has_mask = np.array([m.max() > 0 for m in masks])
-        if has_mask.sum() > 0:
-            pixel_labels = masks[has_mask].reshape(-1)
-            pixel_scores = maps[has_mask].reshape(-1)
+        pixel_labels = masks.reshape(-1)
+        pixel_scores = maps.reshape(-1)
+        if len(np.unique(pixel_labels)) > 1:
             pixel_auroc = roc_auc_score(pixel_labels, pixel_scores) if len(np.unique(pixel_labels)) > 1 else 0.0
         else:
             pixel_auroc = 0.0
 
-        return {"image_auroc": float(image_auroc), "pixel_auroc": float(pixel_auroc)}
+        metrics = {"image_auroc": float(image_auroc), "pixel_auroc": float(pixel_auroc)}
+        if calibration is not None:
+            image_pred = (scores >= float(calibration["image_threshold"])).astype(np.int64)
+            tp = int(((labels == 1) & (image_pred == 1)).sum())
+            tn = int(((labels == 0) & (image_pred == 0)).sum())
+            fp = int(((labels == 0) & (image_pred == 1)).sum())
+            fn = int(((labels == 1) & (image_pred == 0)).sum())
+            metrics.update(
+                {
+                    "image_accuracy": float((tp + tn) / max(1, tp + tn + fp + fn)),
+                    "image_precision": float(tp / max(1, tp + fp)),
+                    "image_recall": float(tp / max(1, tp + fn)),
+                    "image_threshold": float(calibration["image_threshold"]),
+                }
+            )
+        return metrics
 
     @torch.no_grad()
     def visualize_results(self, dataloader, save_dir: str = "./results", num_samples: int = 10):

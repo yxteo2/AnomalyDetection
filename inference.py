@@ -1,11 +1,12 @@
 # inference.py
 # OOP FastFlow inference for MVTec:
 # - exact Resize->CenterCrop preprocessing (torchvision v2)
-# - image-level: Accuracy, Precision, AUROC + F1AdaptiveThreshold for image threshold (auto direction)
+# - image-level: Accuracy, Precision and AUROC with validation-calibrated thresholds
 # - pixel-level: AUROC (sampled) + **SELF-IMPLEMENTED AUPRO** (region overlap) on globally-normalized maps
 # - contour overlay drawn on ORIGINAL image, but thresholding done in crop-space then "uncropped" back
 
 import argparse
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,7 +17,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-from anomalib.metrics.threshold import F1AdaptiveThreshold
 from model import FastFlowModel
 
 
@@ -266,13 +266,25 @@ def auroc_from_scores(y_true: np.ndarray, y_score: np.ndarray) -> float:
     return float(auc)
 
 
-def f1adaptive_threshold_1d(scores: np.ndarray, labels: np.ndarray) -> float:
-    scores_t = torch.tensor(scores, dtype=torch.float32)
-    labels_t = torch.tensor(labels, dtype=torch.int64)
-    metric = F1AdaptiveThreshold()
-    metric.update(scores_t, labels_t)
-    thr = metric.compute()
-    return float(thr.item() if hasattr(thr, "item") else thr)
+def load_calibration(checkpoint_path: str, calibration_path: Optional[str]) -> dict:
+    candidates = []
+    if calibration_path:
+        candidates.append(Path(calibration_path))
+    checkpoint = Path(checkpoint_path)
+    candidates.extend(
+        [checkpoint.parent / "calibration.json", checkpoint.parent.parent / "calibration.json"]
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            with candidate.open("r", encoding="utf-8") as f:
+                calibration = json.load(f)
+            if "image_threshold" not in calibration or "pixel_threshold" not in calibration:
+                raise ValueError(f"Invalid calibration file: {candidate}")
+            print(f"Loaded calibration: {candidate}")
+            return calibration
+    raise FileNotFoundError(
+        "No calibration.json found. Run train.py with the updated pipeline or pass --calibration_path."
+    )
 
 
 # -----------------------------
@@ -342,7 +354,7 @@ def load_gt_mask_mvtec(img_path: Path) -> Optional[np.ndarray]:
 @dataclass
 class Sample:
     path: Path
-    gt_label: int
+    gt_label: Optional[int]
     score_raw: float
     amap_hw: np.ndarray
     orig_rgb: np.ndarray
@@ -359,13 +371,29 @@ class FastFlowInferenceEngine:
         hidden_ratio: float,
         clamp: float,
         conv3x3_only: bool,
+        pretrained_backbone: bool,
         device: str,
         topk_ratio: float,
         crop_scale: float = 0.875,
     ):
         self.device = torch.device(device if (device == "cuda" and torch.cuda.is_available()) else "cpu")
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        model_cfg = ckpt.get("model_cfg", {}) if isinstance(ckpt, dict) else {}
+        backbone = model_cfg.get("backbone_name", backbone)
+        flow_steps = int(model_cfg.get("flow_steps", flow_steps))
+        image_size = tuple(model_cfg.get("input_size", image_size))
+        hidden_ratio = float(model_cfg.get("hidden_ratio", hidden_ratio))
+        clamp = float(model_cfg.get("clamp", clamp))
+        conv3x3_only = bool(model_cfg.get("conv3x3_only", conv3x3_only))
+        pretrained_backbone = bool(model_cfg.get("pretrained_backbone", pretrained_backbone))
+        crop_scale = float(model_cfg.get("crop_scale", crop_scale))
+        reducer_channels = model_cfg.get("reducer_channels")
+
         self.image_size = tuple(image_size)
+        self.backbone = backbone
         self.topk_ratio = float(topk_ratio)
+        if not 0.0 < self.topk_ratio <= 1.0:
+            raise ValueError(f"topk_ratio must be in (0, 1], got {self.topk_ratio}")
 
         if backbone == "wide_resnet50_2":
             self.model = FastFlowModel(
@@ -373,9 +401,12 @@ class FastFlowInferenceEngine:
                 flow_steps=flow_steps,
                 input_size=self.image_size,
                 hidden_ratio=hidden_ratio,
-                reducer_channels=(128, 192, 256),
+                reducer_channels=tuple(reducer_channels or (128, 192, 256)),
                 clamp=clamp,
                 conv3x3_only=conv3x3_only,
+                # The checkpoint contains the frozen backbone weights; avoid a
+                # redundant network download before strict state loading.
+                pretrained_backbone=False,
             )
         else:
             self.model = FastFlowModel(
@@ -385,9 +416,9 @@ class FastFlowInferenceEngine:
                 hidden_ratio=hidden_ratio,
                 clamp=clamp,
                 conv3x3_only=conv3x3_only,
+                pretrained_backbone=False,
             )
 
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
         state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
         self.model.load_state_dict(state, strict=True)
         self.model.to(self.device)
@@ -462,17 +493,11 @@ class FastFlowInferenceEngine:
         orig_rgb: np.ndarray,
         anomaly_map_hw: np.ndarray,
         save_path: Path,
-        pixel_thr_norm: float,
-        global_min: float,
-        global_max: float,
+        pixel_threshold: float,
         min_area: int,
         contour_thickness: int,
     ) -> int:
-        den = (float(global_max) - float(global_min)) + 1e-12
-        vis = (anomaly_map_hw - float(global_min)) / den
-        vis = np.clip(vis, 0.0, 1.0)
-
-        mask_hw = (vis >= float(pixel_thr_norm)).astype(np.uint8) * 255
+        mask_hw = (anomaly_map_hw >= float(pixel_threshold)).astype(np.uint8) * 255
 
         kernel = np.ones((3, 3), np.uint8)
         mask_hw = cv2.morphologyEx(mask_hw, cv2.MORPH_OPEN, kernel, iterations=1)
@@ -505,6 +530,7 @@ class MVTecFastFlowEvaluator:
         save_mode: str,
         pixel_sample_per_image: int = 5000,
         backbone: str = "resnet18",
+        calibration: Optional[dict] = None,
     ):
         self.engine = engine
         self.out_dir = out_dir / category / backbone
@@ -517,14 +543,14 @@ class MVTecFastFlowEvaluator:
         self.aupro_downsample = max(1, int(aupro_downsample))
         self.save_mode = save_mode
         self.pixel_sample_per_image = int(pixel_sample_per_image)
+        self.calibration = calibration or {}
 
         self.samples: List[Sample] = []
 
-        self.direction: float = 1.0
-        self.img_thr: float = 0.0
+        self.img_thr: float = float(self.calibration.get("image_threshold", 0.0))
         self.global_min: float = 0.0
         self.global_max: float = 1.0
-        self.pix_thr_norm: float = 0.5
+        self.pixel_threshold: float = float(self.calibration.get("pixel_threshold", 0.0))
 
         self.image_metrics = {}
         self.pixel_metrics = {}
@@ -533,14 +559,12 @@ class MVTecFastFlowEvaluator:
         self.samples.clear()
         for p in paths:
             gt = infer_gt_label_from_path(p)
-            if gt is None:
-                continue
             score, amap_hw, orig_rgb = self.engine.infer_one(str(p))
             gt_mask_orig = load_gt_mask_mvtec(p)
             self.samples.append(
                 Sample(
                     path=p,
-                    gt_label=int(gt),
+                    gt_label=int(gt) if gt is not None else None,
                     score_raw=float(score),
                     amap_hw=amap_hw,
                     orig_rgb=orig_rgb,
@@ -548,40 +572,33 @@ class MVTecFastFlowEvaluator:
                 )
             )
         if not self.samples:
-            raise RuntimeError("No images have inferable GT labels. Expected MVTec test structure.")
+            raise RuntimeError("No readable images were collected.")
 
     def compute_image_metrics(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        y_true = np.array([s.gt_label for s in self.samples], dtype=np.int64)
+        y_true = np.array([s.gt_label if s.gt_label is not None else -1 for s in self.samples], dtype=np.int64)
         scores = np.array([s.score_raw for s in self.samples], dtype=np.float32)
 
-        n = scores[y_true == 0]
-        a = scores[y_true == 1]
-        self.direction = 1.0
-        if len(n) and len(a) and float(a.mean()) < float(n.mean()):
-            self.direction = -1.0
-
-        eff_scores = scores * self.direction
-        self.img_thr = f1adaptive_threshold_1d(eff_scores, y_true)
-
-        y_pred = (eff_scores > self.img_thr).astype(np.int64)
-        tp, tn, fp, fn = confusion_counts(y_true, y_pred)
-        acc = accuracy_from_counts(tp, tn, fp, fn)
-        prec = precision_from_counts(tp, fp)
-        auc = auroc_from_scores(y_true, eff_scores)
+        eff_scores = scores
+        y_pred = (eff_scores >= self.img_thr).astype(np.int64)
+        labeled = y_true >= 0
+        tp, tn, fp, fn = confusion_counts(y_true[labeled], y_pred[labeled]) if labeled.any() else (0, 0, 0, 0)
+        acc = accuracy_from_counts(tp, tn, fp, fn) if labeled.any() else float("nan")
+        prec = precision_from_counts(tp, fp) if labeled.any() else float("nan")
+        auc = auroc_from_scores(y_true[labeled], eff_scores[labeled]) if labeled.any() else float("nan")
 
         self.image_metrics = {
             "tp": tp, "tn": tn, "fp": fp, "fn": fn,
             "accuracy": acc,
             "precision": prec,
             "auroc": auc,
-            "direction": self.direction,
             "threshold": self.img_thr,
         }
 
-        print(f"[Image] direction={self.direction:+.0f}  img_thr={self.img_thr:.6f}")
-        print(f"[Image] Accuracy:  {acc*100:.2f}%")
-        print(f"[Image] Precision: {prec*100:.2f}%  (TP={tp}, FP={fp}, TN={tn}, FN={fn})")
-        print(f"[Image] AUROC:     {auc:.6f}")
+        print(f"[Image] fixed validation threshold={self.img_thr:.6f}")
+        if labeled.any():
+            print(f"[Image] Accuracy:  {acc*100:.2f}%")
+            print(f"[Image] Precision: {prec*100:.2f}%  (TP={tp}, FP={fp}, TN={tn}, FN={fn})")
+            print(f"[Image] AUROC:     {auc:.6f}")
 
         return y_true, scores, eff_scores, y_pred
 
@@ -624,7 +641,9 @@ class MVTecFastFlowEvaluator:
             )
 
             # sampled pixels for AUROC + pix thr (cheap)
-            flat_pred = pred01.reshape(-1)
+            # Keep raw model scores for fixed validation-threshold application.
+            # AUROC is invariant to the monotonic min-max transform used by AUPRO.
+            flat_pred = s.amap_hw.reshape(-1)
             flat_gt = gt01.reshape(-1).astype(np.int64)
             n = flat_pred.size
             m = min(n, self.pixel_sample_per_image)
@@ -636,9 +655,7 @@ class MVTecFastFlowEvaluator:
         pix_labels_all = np.concatenate(pix_labels_all, axis=0)
 
         pix_auc = auroc_from_scores(pix_labels_all, pix_scores_all)
-        self.pix_thr_norm = f1adaptive_threshold_1d(pix_scores_all, pix_labels_all)
-
-        pix_pred = (pix_scores_all > self.pix_thr_norm).astype(np.int64)
+        pix_pred = (pix_scores_all >= self.pixel_threshold).astype(np.int64)
         tp, tn, fp, fn = confusion_counts(pix_labels_all, pix_pred)
         pix_prec = precision_from_counts(tp, fp)
 
@@ -647,7 +664,7 @@ class MVTecFastFlowEvaluator:
         self.pixel_metrics = {
             "global_min": self.global_min,
             "global_max": self.global_max,
-            "pix_thr_norm": self.pix_thr_norm,
+            "pixel_threshold": self.pixel_threshold,
             "pixel_auroc_sampled": pix_auc,
             "pixel_precision_sampled": pix_prec,
             "pixel_aupro": pixel_aupro,
@@ -655,7 +672,7 @@ class MVTecFastFlowEvaluator:
             "fpr_limit": self.fpr_limit,
         }
 
-        print(f"[Pixel] pix_thr_norm={self.pix_thr_norm:.6f} (sampled)  global_min={self.global_min:.6f} global_max={self.global_max:.6f}")
+        print(f"[Pixel] fixed validation threshold={self.pixel_threshold:.6f}")
         print(f"[Pixel] AUROC:     {pix_auc:.6f} (sampled)")
         print(f"[Pixel] AUPRO@FPR<={self.fpr_limit:.2f}: {pixel_aupro:.6f} (downsample={ds}x)")
         print(f"[Pixel] Precision: {pix_prec*100:.2f}%  (TP={tp}, FP={fp}) (sampled)")
@@ -666,7 +683,7 @@ class MVTecFastFlowEvaluator:
 
         for idx, s in enumerate(self.samples, 1):
             pred = int(y_pred[idx - 1])
-            gt = int(s.gt_label)
+            gt = int(s.gt_label) if s.gt_label is not None else -1
             eff_s = float(eff_scores[idx - 1])
 
             defect = defect_name_from_path(s.path)
@@ -699,9 +716,7 @@ class MVTecFastFlowEvaluator:
                 orig_rgb=s.orig_rgb,
                 anomaly_map_hw=s.amap_hw,
                 save_path=save_path,
-                pixel_thr_norm=self.pix_thr_norm,
-                global_min=self.global_min,
-                global_max=self.global_max,
+                pixel_threshold=self.pixel_threshold,
                 min_area=self.min_area,
                 contour_thickness=self.thickness,
             )
@@ -718,8 +733,11 @@ class MVTecFastFlowEvaluator:
 
     def run(self, paths: List[Path]) -> None:
         self.collect(paths)
-        y_true, scores, eff_scores, y_pred = self.compute_image_metrics()
-        self.compute_pixel_metrics()
+        _, _, eff_scores, y_pred = self.compute_image_metrics()
+        if any(sample.gt_label is not None for sample in self.samples):
+            self.compute_pixel_metrics()
+        else:
+            print("[Metrics] Unlabeled input: dataset metrics skipped.")
         self.save_overlays(eff_scores, y_pred)
 
 
@@ -730,6 +748,7 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--checkpoint_path", type=str, required=True)
+    parser.add_argument("--calibration_path", type=str, default=None)
     parser.add_argument("--image_path", type=str, required=True)   # folder (MVTec test) or single image
     parser.add_argument("--category", type=str, required=True)
 
@@ -739,6 +758,7 @@ def main():
     parser.add_argument("--hidden_ratio", type=float, default=1.0)
     parser.add_argument("--clamp", type=float, default=2.0)
     parser.add_argument("--conv3x3_only", action="store_true")
+    parser.add_argument("--pretrained_backbone", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--topk_ratio", type=float, default=0.01)
 
     parser.add_argument("--save_dir", type=str, default="./inference_results")
@@ -759,6 +779,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
 
     args = parser.parse_args()
+    calibration = load_calibration(args.checkpoint_path, args.calibration_path)
 
     engine = FastFlowInferenceEngine(
         checkpoint_path=args.checkpoint_path,
@@ -768,6 +789,7 @@ def main():
         hidden_ratio=args.hidden_ratio,
         clamp=args.clamp,
         conv3x3_only=args.conv3x3_only,
+        pretrained_backbone=bool(args.pretrained_backbone),
         device=args.device,
         topk_ratio=args.topk_ratio,
     )
@@ -782,7 +804,8 @@ def main():
         aupro_downsample=args.aupro_downsample,
         save_mode=args.save_mode,
         pixel_sample_per_image=args.pixel_sample_per_image,
-        backbone=args.backbone,
+        backbone=engine.backbone,
+        calibration=calibration,
     )
 
     ip = Path(args.image_path)
