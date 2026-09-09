@@ -11,10 +11,9 @@ MVTec-style folders and the original VisA layout.
 | `train.py` | Shared training and final-evaluation command-line entry point |
 | `inference.py` | FastFlow inference, metrics and visualizations |
 | `ssn_inference.py` | SuperSimpleNet inference, metrics and visualizations |
-| `dataset.py` | MVTec, MVTec-style and VisA dataset loading |
-| `trainer.py` | FastFlow training and evaluation utilities |
-| `ssntrainer.py` | SuperSimpleNet training and evaluation utilities |
-| `model/` | Model implementations and public model exports |
+| `anomaly_detection/data.py` | MVTec, MVTec-style and VisA dataset loading |
+| `anomaly_detection/modeling/` | FastFlow and SuperSimpleNet implementations |
+| `anomaly_detection/training/` | Model-specific training and evaluation utilities |
 | `tests/` | Regression tests for evaluation and model behavior |
 
 ## Installation

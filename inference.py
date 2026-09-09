@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from model import FastFlowModel
+from anomaly_detection.modeling import FastFlowModel
 
 
 # ============================================================
