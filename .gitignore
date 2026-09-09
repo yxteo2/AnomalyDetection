@@ -9,6 +9,12 @@ build/
 .venv/
 venv/
 .env
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # ---------- Jupyter ----------
 .ipynb_checkpoints/
@@ -63,3 +69,9 @@ mvtec*/
 *.tif
 *.tiff
 *.gif
+
+# ---------- Local arrays / serialized experiments ----------
+*.npy
+*.npz
+*.pkl
+*.pickle
