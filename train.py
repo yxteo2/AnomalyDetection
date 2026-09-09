@@ -10,7 +10,7 @@ import argparse
 import json
 import math
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 
 import torch
 from torchvision.transforms import v2 as T
@@ -96,6 +96,7 @@ class AnomalyPipeline:
                 hidden_ratio=float(self.cfg["hidden_ratio"]),
                 clamp=float(self.cfg["clamp"]),
                 conv3x3_only=bool(self.cfg["conv3x3_only"]),
+                pretrained_backbone=bool(self.cfg["pretrained_backbone"]),
             )
         else:
             self.model = FastFlowModel(
@@ -105,6 +106,7 @@ class AnomalyPipeline:
                 hidden_ratio=float(self.cfg["hidden_ratio"]),
                 clamp=float(self.cfg["clamp"]),
                 conv3x3_only=bool(self.cfg["conv3x3_only"]),
+                pretrained_backbone=bool(self.cfg["pretrained_backbone"]),
             )
 
     def _build_data(self):
@@ -125,6 +127,9 @@ class AnomalyPipeline:
             image_size=(h, w),
             train_transform=train_tf,
             test_transform=test_tf,
+            dataset_type=self.cfg["dataset_type"],
+            val_ratio=float(self.cfg["val_ratio"]),
+            seed=int(self.cfg["seed"]),
         )
         self.data_module.setup()
 
@@ -136,8 +141,8 @@ class AnomalyPipeline:
                 model=self.model,
                 device=str(self.device),
                 save_dir=str(self.save_dir),
-                monitor="image_auroc",
-                maximize=True,
+                monitor="val_loss",
+                maximize=False,
                 model_cfg={
                     "perlin_threshold": float(self.cfg["perlin_threshold"]),
                     "backbone_name": self.cfg["backbone"],
@@ -146,6 +151,7 @@ class AnomalyPipeline:
                     "adapt_cls_features": bool(self.cfg["adapt_cls_features"]),
                     "input_size": tuple(self.cfg["image_size"]),
                     "pretrained_backbone": bool(self.cfg["pretrained_backbone"]),
+                    "crop_scale": float(self.cfg["crop_scale"]),
                 },
             )
         else:
@@ -156,6 +162,21 @@ class AnomalyPipeline:
                 learning_rate=float(self.cfg["learning_rate"]),
                 weight_decay=float(self.cfg["weight_decay"]),
                 save_dir=str(self.save_dir),
+                monitor="val_loss",
+                maximize=False,
+                model_cfg={
+                    "backbone_name": self.cfg["backbone"],
+                    "flow_steps": int(self.cfg["flow_steps"]),
+                    "input_size": tuple(self.cfg["image_size"]),
+                    "reducer_channels": (128, 192, 256)
+                    if self.cfg["backbone"] == "wide_resnet50_2"
+                    else None,
+                    "hidden_ratio": float(self.cfg["hidden_ratio"]),
+                    "clamp": float(self.cfg["clamp"]),
+                    "conv3x3_only": bool(self.cfg["conv3x3_only"]),
+                    "crop_scale": float(self.cfg["crop_scale"]),
+                    "pretrained_backbone": bool(self.cfg["pretrained_backbone"]),
+                },
             )
 
     def setup(self):
@@ -168,7 +189,7 @@ class AnomalyPipeline:
     def train(self):
         print("\n=== Starting Training ===")
         train_loader = self.data_module.train_dataloader()
-        val_loader = self.data_module.test_dataloader()
+        val_loader = self.data_module.val_dataloader()
 
         self.trainer.fit(
             train_loader=train_loader,
@@ -187,8 +208,18 @@ class AnomalyPipeline:
             self.evaluator = FastFlowEvaluator(model=self.model, device=str(self.device))
 
         test_loader = self.data_module.test_dataloader()
+        val_loader = self.data_module.val_dataloader()
+        val_preds = self.evaluator.predict(val_loader)
+        calibration = self.evaluator.calibrate(
+            val_preds,
+            image_quantile=float(self.cfg["image_threshold_quantile"]),
+            pixel_quantile=float(self.cfg["pixel_threshold_quantile"]),
+        )
+        with open(self.save_dir / "calibration.json", "w", encoding="utf-8") as f:
+            json.dump(calibration, f, indent=4)
+
         preds = self.evaluator.predict(test_loader)
-        metrics = self.evaluator.compute_metrics(preds)
+        metrics = self.evaluator.compute_metrics(preds, calibration=calibration)
 
         print("\n=== Results ===")
         print(f"Image AUROC: {metrics.get('image_auroc', float('nan')):.4f}")
@@ -246,7 +277,8 @@ def parse_args():
     p.add_argument("--perlin_threshold", type=float, default=0.2)
     p.add_argument("--adapt_cls_features", action="store_true")
     p.add_argument("--layers", type=str, nargs="+", default=["layer2", "layer3"])
-    p.add_argument("--pretrained_backbone", action="store_true", default=True)
+    p.add_argument("--pretrained_backbone", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--dataset_type", choices=["auto", "mvtec", "visa"], default="auto")
 
     # training
     p.add_argument("--batch_size", type=int, default=32)
@@ -254,6 +286,10 @@ def parse_args():
     p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-5)
     p.add_argument("--patience", type=int, default=30)
+    p.add_argument("--val_ratio", type=float, default=0.2)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--image_threshold_quantile", type=float, default=0.99)
+    p.add_argument("--pixel_threshold_quantile", type=float, default=0.999)
 
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--save_dir", type=str, default="./checkpoints")

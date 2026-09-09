@@ -265,6 +265,12 @@ class SuperSimpleNetModel(nn.Module):
         self.anomaly_generator = AnomalyGenerator(noise_mean=0.0, noise_std=0.015, threshold=perlin_threshold)
         self.anomaly_map_generator = SSNAnomalyMapGenerator(sigma=4.0)
 
+    def train(self, mode: bool = True):
+        """Set train mode while keeping the frozen backbone deterministic."""
+        super().train(mode)
+        self.feature_extractor.eval()
+        return self
+
     @staticmethod
     def downsample_mask(masks: torch.Tensor, feat_h: int, feat_w: int) -> torch.Tensor:
         masks = masks.to(dtype=torch.float32)
@@ -276,13 +282,17 @@ class SuperSimpleNetModel(nn.Module):
         images: torch.Tensor,
         masks: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
+        generate_synthetic: Optional[bool] = None,
     ):
         out_hw = images.shape[-2:]
 
         features = self.feature_extractor(images)   # (B,C,Hf,Wf)
         adapted = self.adaptor(features)
 
-        if self.training:
+        if generate_synthetic is None:
+            generate_synthetic = self.training
+
+        if generate_synthetic:
             if masks is None:
                 b, _, h, w = features.shape
                 masks = torch.zeros((b, 1, h, w), dtype=torch.float32, device=features.device)
