@@ -4,6 +4,19 @@ PyTorch implementations of FastFlow and SuperSimpleNet (SSN) for image-level
 and pixel-level industrial anomaly detection. The data loader supports MVTec AD,
 MVTec-style folders and the original VisA layout.
 
+## Repository layout
+
+| Path | Purpose |
+| --- | --- |
+| `train.py` | Shared training and final-evaluation command-line entry point |
+| `inference.py` | FastFlow inference, metrics and visualizations |
+| `ssn_inference.py` | SuperSimpleNet inference, metrics and visualizations |
+| `dataset.py` | MVTec, MVTec-style and VisA dataset loading |
+| `trainer.py` | FastFlow training and evaluation utilities |
+| `ssntrainer.py` | SuperSimpleNet training and evaluation utilities |
+| `model/` | Model implementations and public model exports |
+| `tests/` | Regression tests for evaluation and model behavior |
+
 ## Installation
 
 Use Python 3.10 or newer. Install a PyTorch build compatible with your CUDA
@@ -102,7 +115,12 @@ MVTec `test/good` or `test/<defect>` path.
 ## Tests
 
 ```bash
+python -m pip install -r requirements-dev.txt
 python -m pytest -q
 python -m compileall -q .
 python -m pyflakes .
 ```
+
+Pytest settings are kept in `pyproject.toml`. Generated checkpoints, datasets,
+inference outputs and local experiment files are intentionally excluded from
+version control through `.gitignore`.
