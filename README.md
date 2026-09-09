@@ -14,6 +14,11 @@ MVTec-style folders and the original VisA layout.
 | `anomaly_detection/data.py` | MVTec, MVTec-style and VisA dataset loading |
 | `anomaly_detection/modeling/` | FastFlow and SuperSimpleNet implementations |
 | `anomaly_detection/training/` | Model-specific training and evaluation utilities |
+| `anomaly_detection/builder.py` | Configuration-driven model, loss and trainer factories |
+| `anomaly_detection/config.py` | YAML schema, defaults and validation |
+| `anomaly_detection/pipeline.py` | Shared experiment lifecycle |
+| `configs/` | Ready-to-edit FastFlow, SSN focal and SSN BCE YAML experiments |
+| `docs/yaml_training.md` | YAML options, supported combinations and extension guide |
 | `tests/` | Regression tests for evaluation and model behavior |
 
 ## Installation
@@ -47,6 +52,28 @@ thresholds. The MVTec test split is evaluated only after training is complete.
 
 ## Training
 
+### Build a model from YAML
+
+Edit the dataset path/category in `configs/fastflow.yaml` or `configs/ssn.yaml`,
+then run:
+
+```bash
+python train.py --config configs/fastflow.yaml --check-config
+python train.py --config configs/fastflow.yaml
+```
+
+Choose the backbone with `model.backbone`, detector with `model.name`, and loss
+with `loss.name`. Training settings, loss weights and model parameters are also
+configurable. `python -m anomaly_detection --config configs/ssn.yaml` is an
+equivalent entry point. See the [YAML training guide](docs/yaml_training.md) for
+the supported combinations and full examples.
+
+Relative paths resolve from the YAML file's directory. Resolved settings are
+saved with each checkpoint. Use a distinct `output.run_name` for each experiment;
+nonempty output folders require an explicit `output.overwrite: true` opt-in.
+
+### Original command-line interface
+
 FastFlow:
 
 ```bash
@@ -71,11 +98,12 @@ python train.py \
 ```
 
 The output folder contains `best_model.pth`, `calibration.json`, `metrics.json`
-and training plots. Checkpoints include the architecture and preprocessing
-configuration required by inference.
+and `resolved_config.yaml`, plus any model-supported plots. Checkpoints include
+the architecture and preprocessing configuration required by inference.
 
 FastFlow input height and width must be divisible by 16. Use
 `--no-pretrained_backbone` to train SSN without ImageNet initialization.
+Existing run folders require a new `--run_name` or explicit `--overwrite`.
 
 ## Inference
 

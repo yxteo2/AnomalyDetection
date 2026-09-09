@@ -1,0 +1,42 @@
+# Run: python train.py --config configs/fastflow.yaml
+# Paths are relative to THIS YAML file, not the shell's working directory.
+dataset:
+  path: ../data/MVTec
+  category: bottle
+  type: auto
+  val_ratio: 0.2
+
+model:
+  name: fastflow
+  backbone: resnet18   # resnet18 | resnet34 | wide_resnet50_2
+  pretrained: true
+  image_size: [256, 256]  # Both dimensions must be divisible by 16.
+  crop_scale: 0.875
+  params:
+    flow_steps: 8
+    hidden_ratio: 1.0
+    clamp: 2.0
+    conv3x3_only: false
+
+loss:
+  name: fastflow_nll
+
+training:
+  epochs: 100
+  batch_size: 16
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  patience: 30
+  num_workers: 4
+  seed: 42
+  device: auto  # auto | cpu | cuda
+
+evaluation:
+  image_threshold_quantile: 0.99
+  pixel_threshold_quantile: 0.999
+  num_visualizations: 10
+
+output:
+  save_dir: ../checkpoints
+  run_name: baseline
+  overwrite: false
