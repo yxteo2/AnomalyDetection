@@ -1,0 +1,49 @@
+# Run: python train.py --config configs/ssn.yaml
+dataset:
+  path: ../data/MVTec
+  category: bottle
+  type: auto
+  val_ratio: 0.2
+
+model:
+  name: ssn
+  backbone: resnet18
+  pretrained: true
+  image_size: [256, 256]
+  crop_scale: 0.875
+  params:
+    layers: [layer2, layer3]
+    perlin_threshold: 0.2
+    adapt_cls_features: false
+
+loss:
+  name: ssn_focal
+  params:
+    gamma: 4.0
+    alpha: -1.0
+    truncation_term: 0.5
+    seg_weight: 1.0
+    cls_weight: 1.0
+    truncation_weight: 1.0
+
+training:
+  epochs: 100
+  batch_size: 16
+  learning_rate: 0.0001
+  head_lr_multiplier: 2.0
+  weight_decay: 0.00001  # SSN segmentation/detection heads
+  adaptor_weight_decay: 0.01
+  patience: 30
+  num_workers: 4
+  seed: 42
+  device: auto
+
+evaluation:
+  image_threshold_quantile: 0.99
+  pixel_threshold_quantile: 0.999
+  num_visualizations: 0
+
+output:
+  save_dir: ../checkpoints
+  run_name: focal
+  overwrite: false

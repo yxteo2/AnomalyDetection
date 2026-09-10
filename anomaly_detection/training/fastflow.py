@@ -11,6 +11,8 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
+from anomaly_detection.training.losses import FastFlowNLLLoss
+
 
 class FastFlowTrainer:
     """Trainer for FastFlow anomaly detection model (anomalib-style monitoring)."""
@@ -26,6 +28,8 @@ class FastFlowTrainer:
         monitor: str = "val_loss",
         maximize: bool = False,
         model_cfg: Optional[Dict[str, Any]] = None,
+        loss_fn: Optional[nn.Module] = None,
+        experiment_cfg: Optional[Dict[str, Any]] = None,
     ):
         self.model = model.to(device)
         self.device = device
@@ -37,6 +41,8 @@ class FastFlowTrainer:
         self.monitor = monitor
         self.maximize = maximize
         self.model_cfg = model_cfg or {}
+        self.experiment_cfg = experiment_cfg or {}
+        self.loss_fn = (loss_fn if loss_fn is not None else FastFlowNLLLoss()).to(device)
 
         self.optimizer = Adam(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
@@ -51,11 +57,7 @@ class FastFlowTrainer:
         }
 
     def _fastflow_loss(self, hidden_vars, jacobians) -> torch.Tensor:
-        # sum_l mean( 0.5*sum(z^2) - log_detJ )
-        loss = torch.zeros((), device=self.device)
-        for z, log_j in zip(hidden_vars, jacobians):
-            loss = loss + (0.5 * (z ** 2).sum(dim=(1, 2, 3)) - log_j).mean()
-        return loss
+        return self.loss_fn(hidden_vars, jacobians)
 
     def train_epoch(self, dataloader) -> float:
         self.model.train()
@@ -171,6 +173,7 @@ class FastFlowTrainer:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "history": self.history,
             "model_cfg": self.model_cfg,
+            "experiment_cfg": self.experiment_cfg,
         }
         torch.save(checkpoint, self.save_dir / filename)
 

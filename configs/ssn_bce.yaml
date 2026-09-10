@@ -1,0 +1,29 @@
+# An alternative objective for controlled SSN loss comparisons (not a claimed improvement).
+dataset:
+  path: ../data/MVTec
+  category: bottle
+
+model:
+  name: ssn
+  backbone: resnet18
+  pretrained: true
+  image_size: [256, 256]
+  params:
+    layers: [layer2, layer3]
+
+loss:
+  name: ssn_bce
+  params:
+    seg_weight: 1.0
+    cls_weight: 1.0
+
+training:
+  epochs: 100
+  batch_size: 16
+  learning_rate: 0.0001
+  device: auto
+
+output:
+  save_dir: ../checkpoints
+  run_name: bce
+  overwrite: false

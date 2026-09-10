@@ -20,11 +20,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import MultiStepLR
 from tqdm import tqdm
 
-# ---- focal loss (torchvision) ----
-try:
-    from torchvision.ops import sigmoid_focal_loss
-except Exception:
-    sigmoid_focal_loss = None
+from anomaly_detection.training.losses import SSNLoss
 
 
 # =============================================================================
@@ -81,63 +77,6 @@ def _binarize_mask_np(mask: np.ndarray) -> np.ndarray:
 
 
 # =============================================================================
-# SuperSimpleNet (SSN) - anomalib-style loss
-# =============================================================================
-class SSNLoss(nn.Module):
-    """Loss used by anomalib's SuperSimpleNet.
-
-    Total = focal(map_logits) + trunc(map_prob) + focal(score_logits)
-    """
-
-    def __init__(self, truncation_term: float = 0.5):
-        super().__init__()
-        if sigmoid_focal_loss is None:
-            raise RuntimeError(
-                "torchvision.ops.sigmoid_focal_loss not available. "
-                "Please ensure torchvision is installed correctly."
-            )
-        self.gamma = 4.0
-        self.alpha = -1  # anomalib uses alpha=-1
-        self.th = float(truncation_term)
-
-    def focal(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return sigmoid_focal_loss(logits, target, alpha=self.alpha, gamma=self.gamma, reduction="mean")
-
-    def trunc_l1_loss(self, pred_map_logits: torch.Tensor, target_mask: torch.Tensor) -> torch.Tensor:
-        """
-        IMPORTANT FIX:
-        Apply truncation on probabilities (sigmoid), not raw logits.
-        This stabilizes training a lot (logits can drift in scale).
-        """
-        pred = pred_map_logits.sigmoid()
-
-        normal_scores = pred[target_mask == 0]
-        anomalous_scores = pred[target_mask > 0]
-
-        # Encourage: normals low, anomalies high (soft margin self.th)
-        # - penalize normals if > (1 - th)
-        # - penalize anomalies if < th
-        true_loss = torch.clamp(normal_scores - (1.0 - self.th), min=0.0)
-        fake_loss = torch.clamp(self.th - anomalous_scores, min=0.0)
-
-        true_loss = true_loss.mean() if true_loss.numel() else pred.new_tensor(0.0)
-        fake_loss = fake_loss.mean() if fake_loss.numel() else pred.new_tensor(0.0)
-        return true_loss + fake_loss
-
-    def forward(
-        self,
-        pred_map_logits: torch.Tensor,
-        pred_score_logits: torch.Tensor,
-        target_mask: torch.Tensor,
-        target_label: torch.Tensor,
-    ) -> torch.Tensor:
-        map_focal = self.focal(pred_map_logits, target_mask)
-        map_trunc = self.trunc_l1_loss(pred_map_logits, target_mask)
-        score_focal = self.focal(pred_score_logits, target_label)
-        return map_focal + map_trunc + score_focal
-
-
-# =============================================================================
 # Trainer
 # =============================================================================
 class SuperSimpleNetTrainer:
@@ -156,6 +95,12 @@ class SuperSimpleNetTrainer:
         monitor: str = "val_loss",
         maximize: bool = False,
         model_cfg: Optional[Dict[str, Any]] = None,  # store SSN init args for strict inference
+        learning_rate: float = 1e-4,
+        weight_decay: float = 1e-5,
+        head_lr_multiplier: float = 2.0,
+        adaptor_weight_decay: float = 0.01,
+        loss_fn: Optional[nn.Module] = None,
+        experiment_cfg: Optional[Dict[str, Any]] = None,
     ):
         self.model = model.to(device)
         self.device = device
@@ -167,18 +112,19 @@ class SuperSimpleNetTrainer:
         self.maximize = maximize
 
         self.model_cfg = model_cfg or {}
+        self.experiment_cfg = experiment_cfg or {}
 
         # anomalib-style optimizer: two param groups
         adaptor_params = list(getattr(self.model, "adaptor").parameters())
         segdec_params = list(getattr(self.model, "segdec").parameters())
         self.optimizer = AdamW(
             [
-                {"params": adaptor_params, "lr": 1e-4},
-                {"params": segdec_params, "lr": 2e-4, "weight_decay": 1e-5},
+                {"params": adaptor_params, "lr": learning_rate, "weight_decay": adaptor_weight_decay},
+                {"params": segdec_params, "lr": learning_rate * head_lr_multiplier, "weight_decay": weight_decay},
             ]
         )
 
-        self.loss_fn = SSNLoss()
+        self.loss_fn = (loss_fn if loss_fn is not None else SSNLoss()).to(device)
 
         self.history = {
             "train_loss": [],
@@ -273,6 +219,7 @@ class SuperSimpleNetTrainer:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "history": self.history,
             "model_cfg": self.model_cfg,
+            "experiment_cfg": self.experiment_cfg,
         }
         torch.save(ckpt, self.save_dir / filename)
 
@@ -296,7 +243,10 @@ class SuperSimpleNetTrainer:
     def fit(self, train_loader, val_loader, num_epochs: int = 100, patience: int = 10, eval_every: int = 1):
         scheduler = MultiStepLR(
             self.optimizer,
-            milestones=[int(num_epochs * 0.8), int(num_epochs * 0.9)],
+            # Short YAML smoke runs must start at the requested learning rate;
+            # milestone zero would decay it before the first optimizer step.
+            milestones=sorted({int(num_epochs * fraction) for fraction in (0.8, 0.9)
+                               if 0 < int(num_epochs * fraction) < num_epochs}),
             gamma=0.4,
         )
         best = self.history["best_metric"]
