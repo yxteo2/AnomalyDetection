@@ -14,8 +14,8 @@ from anomaly_detection.cli import main
 from anomaly_detection.config import load_config, resolve_config
 from anomaly_detection.pipeline import AnomalyPipeline
 from anomaly_detection.training.losses import FastFlowNLLLoss, SSNBCELoss, SSNLoss
-from inference import FastFlowInferenceEngine
-from ssn_inference import SSNInferenceEngine
+from inference import FastFlowInferenceEngine, MVTecFastFlowEvaluator, iter_images_recursive, load_calibration
+from ssn_inference import SSNInferenceEngine, MVTecSSNEvaluator
 
 
 @pytest.fixture(autouse=True)
@@ -168,6 +168,23 @@ def test_yaml_runs_real_training_and_existing_inference(tmp_path, monkeypatch, m
     score, anomaly_map, _ = engine.infer_one(str(tmp_path / "data/bottle/test/good/000.png"))
     assert np.isfinite(score) and np.isfinite(anomaly_map).all()
     assert anomaly_map.shape == (32, 32)
+
+    # Exercise the inference scripts' shared file/calibration/metric helpers
+    # with real predictions from the newly trained checkpoint.
+    evaluator_cls = MVTecFastFlowEvaluator if model_name == "fastflow" else MVTecSSNEvaluator
+    evaluator = evaluator_cls(
+        engine=engine, out_dir=tmp_path / "inference", category="bottle", backbone="resnet18",
+        min_area=0, thickness=1, fpr_limit=0.3, aupro_downsample=1, save_mode="pred",
+        calibration=load_calibration(str(checkpoint_path), None),
+    )
+    evaluator.collect(list(iter_images_recursive(tmp_path / "data/bottle/test")))
+    labels, _, _, _ = evaluator.compute_image_metrics()
+    assert sorted(labels.tolist()) == [0, 1]
+    evaluator.compute_pixel_metrics()
+    assert np.isfinite(evaluator.image_metrics["auroc"])
+    assert np.isfinite(evaluator.pixel_metrics["pixel_auroc_sampled"])
+    assert 0 <= evaluator.pixel_metrics["pixel_aupro"] <= 1
+    assert evaluator.image_metrics["threshold"] == calibration["image_threshold"]
 
     # A second invocation must not overwrite a completed experiment implicitly.
     with pytest.raises(FileExistsError, match="Output directory is not empty"):
