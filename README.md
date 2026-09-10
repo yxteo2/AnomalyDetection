@@ -8,18 +8,38 @@ MVTec-style folders and the original VisA layout.
 
 | Path | Purpose |
 | --- | --- |
-| `train.py` | Shared training and final-evaluation command-line entry point |
+| `train.py`, `anomaly_detection/__main__.py` | Script and `python -m` entry points for the same training pipeline |
+| `anomaly_detection/cli.py` | Shared argument parsing for YAML and the original training flags |
 | `inference.py` | FastFlow inference, metrics and visualizations |
 | `ssn_inference.py` | SuperSimpleNet inference, metrics and visualizations |
+| `anomaly_detection/inference_utils.py` | Shared AUROC/AUPRO metrics, calibration loading and MVTec file helpers |
 | `anomaly_detection/data.py` | MVTec, MVTec-style and VisA dataset loading |
-| `anomaly_detection/modeling/` | FastFlow and SuperSimpleNet implementations |
-| `anomaly_detection/training/` | Model-specific training and evaluation utilities |
+| `anomaly_detection/modeling/` | Detector implementations in `fastflow.py` and `supersimplenet.py` |
+| `anomaly_detection/training/fastflow.py`, `anomaly_detection/training/supersimplenet.py` | Model-specific optimizers, training, calibration and final evaluation |
+| `anomaly_detection/training/losses.py` | FastFlow NLL, SSN focal and SSN BCE objectives |
 | `anomaly_detection/builder.py` | Configuration-driven model, loss and trainer factories |
 | `anomaly_detection/config.py` | YAML schema, defaults and validation |
 | `anomaly_detection/pipeline.py` | Shared experiment lifecycle |
-| `configs/` | Ready-to-edit FastFlow, SSN focal and SSN BCE YAML experiments |
-| `docs/yaml_training.md` | YAML options, supported combinations and extension guide |
-| `tests/` | Regression tests for evaluation and model behavior |
+| `configs/fastflow.yaml` | FastFlow experiment with its NLL loss |
+| `configs/ssn.yaml` | SSN experiment with its focal loss |
+| `configs/ssn_bce.yaml` | SSN experiment with the alternative BCE loss |
+| `README.md`, `docs/yaml_training.md` | Quick start and commands; detailed YAML reference and extension guide |
+| `tests/test_config.py` | Configuration validation and command-line error handling |
+| `tests/test_regressions.py` | Model contracts, calibration, inference metrics and file handling |
+| `tests/test_yaml_training.py` | Component selection and offline training/checkpoint/inference integration |
+| `requirements.txt`, `requirements-dev.txt` | Runtime dependencies; runtime dependencies plus test and static-check tools |
+| `pyproject.toml` | Pytest discovery and reporting settings |
+| `.github/workflows/tests.yml` | Automated CPU tests and static checks on pushes and pull requests |
+| `.editorconfig` | Consistent indentation, encoding and line endings |
+| `.gitignore` | Excludes local environments, datasets, caches and generated outputs |
+
+The three `__init__.py` files define the package boundaries and public model and
+trainer imports. The training entry points share one implementation; the two
+inference scripts retain their model-specific checkpoint handling and overlays.
+
+For a new experiment, copy a file in `configs/` and edit the YAML. Reusable Python
+code belongs in `anomaly_detection/`, with checks in `tests/` and usage details in
+`docs/`. Keep downloaded datasets, checkpoints and generated images out of Git.
 
 ## Installation
 

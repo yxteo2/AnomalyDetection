@@ -1,10 +1,4 @@
-# ssntrainer.py
-# Updated anomalib-style SSN trainer/evaluator with:
-# - Stable truncation loss (applies on sigmoid(map_logits))
-# - Validation-loss checkpoint selection with an untouched test set
-# - Fixed anomaly-score direction (higher means more anomalous)
-# - Mask alignment safety (resizes masks to pred_map size with NEAREST)
-# - Accuracy and precision from validation-calibrated fixed thresholds
+"""SuperSimpleNet training, validation calibration and final evaluation."""
 
 from __future__ import annotations
 

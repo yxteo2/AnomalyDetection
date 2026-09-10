@@ -1,4 +1,5 @@
-# trainer.py
+"""FastFlow training, validation calibration and final evaluation."""
+
 from pathlib import Path
 from typing import Any, Dict, Optional
 
