@@ -3,11 +3,9 @@ import pytest
 import torch
 
 from inference import auroc_from_scores, infer_gt_label_from_path
-from model.fastflow import FastFlowModel
-from model.supersimplenet import SuperSimpleNetModel
+from anomaly_detection.modeling import FastFlowModel, SuperSimpleNetModel
+from anomaly_detection.training import FastFlowEvaluator, SuperSimpleNetEvaluator
 from ssn_inference import infer_gt_label_from_path as infer_ssn_gt_label
-from ssntrainer import SuperSimpleNetEvaluator
-from trainer import FastFlowEvaluator
 
 
 def test_auroc_does_not_silently_reverse_scores():

@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from model import SuperSimpleNetModel  # uses your SSN implementation
+from anomaly_detection.modeling import SuperSimpleNetModel
 
 
 # ============================================================

@@ -15,10 +15,14 @@ from typing import Dict, Any, List
 import torch
 from torchvision.transforms import v2 as T
 
-from model import FastFlowModel, SuperSimpleNetModel
-from dataset import MVTecDataModule
-from trainer import FastFlowTrainer, FastFlowEvaluator
-from ssntrainer import SuperSimpleNetTrainer, SuperSimpleNetEvaluator
+from anomaly_detection.data import MVTecDataModule
+from anomaly_detection.modeling import FastFlowModel, SuperSimpleNetModel
+from anomaly_detection.training import (
+    FastFlowEvaluator,
+    FastFlowTrainer,
+    SuperSimpleNetEvaluator,
+    SuperSimpleNetTrainer,
+)
 
 
 # -----------------------------
