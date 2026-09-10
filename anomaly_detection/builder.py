@@ -6,11 +6,12 @@ Factories are explicit allowlists: YAML never imports or executes arbitrary code
 from anomaly_detection.config import resolve_config
 from anomaly_detection.modeling import FastFlowModel, SuperSimpleNetModel
 from anomaly_detection.training import FastFlowTrainer, SuperSimpleNetTrainer
-from anomaly_detection.training.losses import FastFlowNLLLoss, SSNBCELoss, SSNLoss
+from anomaly_detection.training.losses import FastFlowNLLLoss, SSNBCELoss, SSNLoss, SSNBCEDiceLoss, SSNFocalDiceLoss
 
 
 MODEL_BUILDERS = {"fastflow": FastFlowModel, "ssn": SuperSimpleNetModel}
 LOSS_BUILDERS = {"fastflow_nll": FastFlowNLLLoss, "ssn_focal": SSNLoss, "ssn_bce": SSNBCELoss}
+LOSS_BUILDERS.update(ssn_bce_dice=SSNBCEDiceLoss, ssn_focal_dice=SSNFocalDiceLoss)
 
 
 def model_kwargs(cfg):
@@ -27,6 +28,7 @@ def model_kwargs(cfg):
     else:
         kwargs.update({key: cfg[key] for key in ("perlin_threshold", "layers", "adapt_cls_features")})
         kwargs["stop_grad"] = True
+        kwargs.update({key: cfg[key] for key in ("dino_layers", "feature_channels", "backbone_precision")})
     return kwargs
 
 
@@ -48,6 +50,7 @@ def build_trainer(cfg, model, device, save_dir):
         "model_cfg": {**model_kwargs(cfg), "crop_scale": cfg["crop_scale"]},
         "loss_fn": build_loss(cfg), "experiment_cfg": cfg,
         "monitor": "val_loss", "maximize": False,
+        "accumulate_grad_batches": cfg["accumulate_grad_batches"],
     }
     if cfg["model"] == "fastflow":
         return FastFlowTrainer(backbone_name=cfg["backbone"], **kwargs)

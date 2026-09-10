@@ -15,10 +15,12 @@ class ConfigError(ValueError):
     """An invalid or unsupported experiment configuration."""
 
 
-BACKBONES = ("resnet18", "resnet34", "wide_resnet50_2")
+RESNET_BACKBONES = ("resnet18", "resnet34", "wide_resnet50_2")
+DINO_BACKBONES = ("dinov2_vits14", "dinov2_vitb14")
+BACKBONES = RESNET_BACKBONES + DINO_BACKBONES
 MODEL_PARAMS = {
     "fastflow": {"flow_steps", "hidden_ratio", "clamp", "conv3x3_only"},
-    "ssn": {"perlin_threshold", "adapt_cls_features", "layers"},
+    "ssn": {"perlin_threshold", "adapt_cls_features", "layers", "dino_layers", "feature_channels", "backbone_precision"},
 }
 LOSS_DEFAULTS = {
     "fastflow_nll": {},
@@ -26,9 +28,13 @@ LOSS_DEFAULTS = {
         "gamma": 4.0, "alpha": -1.0, "truncation_term": 0.5,
         "seg_weight": 1.0, "cls_weight": 1.0, "truncation_weight": 1.0,
     },
-    "ssn_bce": {"seg_weight": 1.0, "cls_weight": 1.0},
+    "ssn_bce": {"seg_weight": 1.0, "cls_weight": 1.0, "seg_pos_weight": 1.0, "cls_pos_weight": 1.0},
 }
-MODEL_LOSSES = {"fastflow": ("fastflow_nll",), "ssn": ("ssn_focal", "ssn_bce")}
+LOSS_DEFAULTS["ssn_bce_dice"] = {**LOSS_DEFAULTS["ssn_bce"], "dice_weight": 1.0, "dice_smooth": 1e-6}
+LOSS_DEFAULTS["ssn_focal_dice"] = {
+    **LOSS_DEFAULTS["ssn_focal"], "truncation_weight": 0.0, "dice_weight": 1.0, "dice_smooth": 1e-6,
+}
+MODEL_LOSSES = {"fastflow": ("fastflow_nll",), "ssn": ("ssn_focal", "ssn_bce", "ssn_bce_dice", "ssn_focal_dice")}
 
 # Keep the existing command-line defaults, and share them with YAML experiments.
 DEFAULTS = {
@@ -37,6 +43,8 @@ DEFAULTS = {
     "image_size": [416, 416], "crop_scale": 0.875,
     "flow_steps": 8, "hidden_ratio": 1.0, "clamp": 2.0, "conv3x3_only": False,
     "perlin_threshold": 0.2, "adapt_cls_features": False, "layers": ["layer2", "layer3"],
+    "dino_layers": [11], "feature_channels": None, "backbone_precision": "float32",
+    "accumulate_grad_batches": 1,
     "loss_name": None, "loss_params": {},
     "batch_size": 32, "num_epochs": 100, "learning_rate": 1e-4,
     "weight_decay": 1e-5, "head_lr_multiplier": 2.0, "adaptor_weight_decay": 0.01,
@@ -57,6 +65,7 @@ SECTIONS = {
         "weight_decay": "weight_decay", "patience": "patience", "seed": "seed",
         "device": "device", "num_workers": "num_workers",
         "head_lr_multiplier": "head_lr_multiplier", "adaptor_weight_decay": "adaptor_weight_decay",
+        "accumulate_grad_batches": "accumulate_grad_batches",
     },
     "evaluation": {
         "image_threshold_quantile": "image_threshold_quantile",
@@ -120,6 +129,26 @@ def resolve_config(options):
         _component(cfg["run_name"], "output.run_name")
     _choice(cfg["model"], MODEL_PARAMS, "model.name")
     _choice(cfg["backbone"], BACKBONES, "model.backbone")
+    if cfg["model"] == "fastflow" and cfg["backbone"] in DINO_BACKBONES:
+        raise ConfigError("DINOv2 currently supports SSN only; FastFlow requires ResNet spatial stages.")
+    if cfg["backbone"] in DINO_BACKBONES and cfg["layers"] != DEFAULTS["layers"]:
+        raise ConfigError("DINOv2 uses dino_layers; layers selects ResNet stages only.")
+    if cfg["backbone"] not in DINO_BACKBONES and cfg["dino_layers"] != DEFAULTS["dino_layers"]:
+        raise ConfigError("dino_layers selects DINOv2 blocks only.")
+    _choice(cfg["backbone_precision"], ("float32", "bfloat16"), "backbone_precision")
+    if cfg["backbone"] not in DINO_BACKBONES and cfg["backbone_precision"] != "float32":
+        raise ConfigError("bfloat16 backbone_precision is currently DINOv2-only.")
+    dino_layers = cfg["dino_layers"]
+    if (not isinstance(dino_layers, list) or not dino_layers or
+            any(type(i) is not int or not 0 <= i < 12 for i in dino_layers) or
+            dino_layers != sorted(set(dino_layers))):
+        raise ConfigError("dino_layers must be unique ordered block indices in [0, 11].")
+    channels = cfg["feature_channels"]
+    if channels is not None:
+        if type(channels) is not int or channels < 1:
+            raise ConfigError("feature_channels must be a positive integer or null.")
+        if cfg["model"] != "ssn" or not cfg["adapt_cls_features"]:
+            raise ConfigError("feature_channels requires SSN with adapt_cls_features: true.")
     _choice(cfg["dataset_type"], ("auto", "mvtec", "visa"), "dataset.type")
     _choice(cfg["device"], ("auto", "cpu", "cuda"), "training.device")
     for name in ("pretrained_backbone", "conv3x3_only", "adapt_cls_features", "overwrite"):
@@ -127,7 +156,7 @@ def resolve_config(options):
             raise ConfigError(f"{name} must be true or false (not a quoted string).")
     for name, minimum in {
         "flow_steps": 1, "batch_size": 1, "num_epochs": 1, "patience": 1,
-        "num_workers": 0, "seed": 0, "num_visualizations": 0,
+        "num_workers": 0, "seed": 0, "num_visualizations": 0, "accumulate_grad_batches": 1,
     }.items():
         if type(cfg[name]) is not int or cfg[name] < minimum:
             raise ConfigError(f"{name} must be an integer >= {minimum}.")
@@ -166,9 +195,11 @@ def resolve_config(options):
         lower = -1.0 if name == "alpha" else 0.0
         upper = 1.0 if name in ("alpha", "truncation_term") else None
         params[name] = _number(params[name], f"loss.params.{name}", lower, upper)
+        if name in ("seg_pos_weight", "cls_pos_weight", "dice_smooth") and params[name] <= 0:
+            raise ConfigError(f"loss.params.{name} must be positive.")
     if "alpha" in params and params["alpha"] != -1.0 and params["alpha"] < 0:
         raise ConfigError("loss.params.alpha must be -1 or between 0 and 1.")
-    weights = [v for k, v in params.items() if k.endswith("_weight")]
+    weights = [v for k, v in params.items() if k in {"seg_weight", "cls_weight", "truncation_weight", "dice_weight"}]
     if weights and not any(weights):
         raise ConfigError("At least one loss weight must be positive.")
     cfg["loss_name"], cfg["loss_params"] = loss_name, params

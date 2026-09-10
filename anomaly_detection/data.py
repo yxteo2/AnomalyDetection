@@ -347,6 +347,7 @@ class MVTecDataModule:
         dataset_type: str = "auto",
         val_ratio: float = 0.2,
         seed: int = 42,
+        pin_memory: Optional[bool] = None,
     ):
         self.root_dir = root_dir
         self.category = category
@@ -360,6 +361,7 @@ class MVTecDataModule:
             raise ValueError(f"val_ratio must be between 0 and 1, got {val_ratio}")
         self.val_ratio = float(val_ratio)
         self.seed = int(seed)
+        self.pin_memory = torch.cuda.is_available() if pin_memory is None else bool(pin_memory)
 
         self.train_dataset = None
         self.val_dataset = None
@@ -418,7 +420,7 @@ class MVTecDataModule:
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
-            pin_memory=True,
+            pin_memory=self.pin_memory,
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -427,7 +429,7 @@ class MVTecDataModule:
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            pin_memory=True,
+            pin_memory=self.pin_memory,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -436,7 +438,7 @@ class MVTecDataModule:
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            pin_memory=True,
+            pin_memory=self.pin_memory,
         )
 
     @staticmethod

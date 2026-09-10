@@ -18,6 +18,7 @@ import torch
 from PIL import Image
 
 from anomaly_detection.modeling import SuperSimpleNetModel
+from anomaly_detection.config import BACKBONES
 
 
 # ============================================================
@@ -343,6 +344,9 @@ class SSNInferenceEngine:
         pretrained_backbone: bool,
         device: str,
         crop_scale: float = 0.875,
+        dino_layers: Optional[List[int]] = None,
+        feature_channels: Optional[int] = None,
+        backbone_precision: Optional[str] = None,
     ):
         self.device = torch.device(device if (device == "cuda" and torch.cuda.is_available()) else "cpu")
         ckpt = torch.load(checkpoint_path, map_location="cpu")
@@ -367,6 +371,10 @@ class SSNInferenceEngine:
             input_size=self.image_size,
             # The checkpoint includes the frozen backbone weights.
             pretrained_backbone=False,
+            dino_layers=model_cfg.get("dino_layers", dino_layers),
+            feature_channels=model_cfg.get("feature_channels", feature_channels),
+            backbone_precision=(backbone_precision if backbone_precision is not None
+                                else model_cfg.get("backbone_precision", "float32")),
         )
 
         state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
@@ -685,8 +693,11 @@ def main():
     parser.add_argument("--category", type=str, required=True)
 
     # SSN model args (must match training)
-    parser.add_argument("--backbone", type=str, default="resnet18", choices=["resnet18", "resnet34", "wide_resnet50_2"])
+    parser.add_argument("--backbone", type=str, default="resnet18", choices=BACKBONES)
     parser.add_argument("--layers", type=str, nargs="+", default=["layer2", "layer3"])
+    parser.add_argument("--dino_layers", type=int, nargs="+", default=None)
+    parser.add_argument("--feature_channels", type=int, default=None)
+    parser.add_argument("--backbone_precision", choices=["float32", "bfloat16"], default=None)
     parser.add_argument("--perlin_threshold", type=float, default=0.2)
     parser.add_argument("--adapt_cls_features", action="store_true")
     parser.add_argument("--pretrained_backbone", action=argparse.BooleanOptionalAction, default=True)
@@ -717,6 +728,9 @@ def main():
         perlin_threshold=args.perlin_threshold,
         adapt_cls_features=args.adapt_cls_features,
         layers=list(args.layers),
+        dino_layers=args.dino_layers,
+        feature_channels=args.feature_channels,
+        backbone_precision=args.backbone_precision,
         pretrained_backbone=bool(args.pretrained_backbone),
         device=args.device,
     )

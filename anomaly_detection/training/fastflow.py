@@ -12,6 +12,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
 from anomaly_detection.training.losses import FastFlowNLLLoss
+from anomaly_detection.training.accumulation import GradientAccumulator
 
 
 class FastFlowTrainer:
@@ -30,6 +31,7 @@ class FastFlowTrainer:
         model_cfg: Optional[Dict[str, Any]] = None,
         loss_fn: Optional[nn.Module] = None,
         experiment_cfg: Optional[Dict[str, Any]] = None,
+        accumulate_grad_batches: int = 1,
     ):
         self.model = model.to(device)
         self.device = device
@@ -43,7 +45,10 @@ class FastFlowTrainer:
         self.model_cfg = model_cfg or {}
         self.experiment_cfg = experiment_cfg or {}
         self.loss_fn = (loss_fn if loss_fn is not None else FastFlowNLLLoss()).to(device)
+        self.accumulate_grad_batches = accumulate_grad_batches
 
+        # Keep parameter-group layout compatible with existing checkpoints. Adam
+        # allocates no momentum buffers for frozen parameters with grad=None.
         self.optimizer = Adam(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
         self.history = {
@@ -64,6 +69,7 @@ class FastFlowTrainer:
         total_loss = 0.0
         num_batches = 0
 
+        accumulator = GradientAccumulator(self.optimizer, self.accumulate_grad_batches)
         pbar = tqdm(dataloader, desc="Training")
         for batch in pbar:
             images = batch["image"].to(self.device)
@@ -71,14 +77,13 @@ class FastFlowTrainer:
             hidden_vars, jacobians = self.model(images)  # anomalib-style output in train
             loss = self._fastflow_loss(hidden_vars, jacobians)
 
-            self.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            self.optimizer.step()
+            accumulator.backward(loss, images.shape[0])
 
             total_loss += float(loss.item())
             num_batches += 1
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
+        accumulator.step()
         return total_loss / max(1, num_batches)
 
     @torch.no_grad()
@@ -177,11 +182,12 @@ class FastFlowTrainer:
         }
         torch.save(checkpoint, self.save_dir / filename)
 
-    def load_checkpoint(self, filename: str):
+    def load_checkpoint(self, filename: str, load_optimizer: bool = True):
         path = self.save_dir / filename
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if load_optimizer:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.history = checkpoint["history"]
         self.model_cfg = checkpoint.get("model_cfg", self.model_cfg)
         print(f"Checkpoint loaded from {path}")

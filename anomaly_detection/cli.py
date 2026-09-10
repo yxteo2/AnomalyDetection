@@ -4,7 +4,7 @@ import argparse
 
 import yaml
 
-from anomaly_detection.config import BACKBONES, ConfigError, as_yaml_config, load_config, resolve_config
+from anomaly_detection.config import BACKBONES, LOSS_DEFAULTS, ConfigError, as_yaml_config, load_config, resolve_config
 
 
 def parse_args(argv=None):
@@ -39,7 +39,8 @@ def parse_args(argv=None):
     parser.add_argument("--save_dir")
     parser.add_argument("--run_name")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"])
-    parser.add_argument("--loss", dest="loss_name", choices=["fastflow_nll", "ssn_focal", "ssn_bce"])
+    parser.add_argument("--loss", dest="loss_name", choices=LOSS_DEFAULTS)
+    parser.add_argument("--accumulate_grad_batches", type=int)
     parser.add_argument("--overwrite", action="store_true")
     args = vars(parser.parse_args(argv))
     config_path = args.pop("config", None)

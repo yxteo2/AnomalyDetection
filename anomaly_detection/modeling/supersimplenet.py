@@ -7,6 +7,8 @@ import torch.nn.functional as F
 import torchvision.models as models
 from torchvision.models.feature_extraction import create_feature_extractor
 
+from anomaly_detection.modeling.dinov2 import DINO_MODELS, DinoFeatureExtractor, pad_to_patch_grid
+
 
 def _init_weights(module: nn.Module) -> None:
     """Xavier init for Linear/Conv and constant=1 for BN weights."""
@@ -68,6 +70,10 @@ class UpscalingFeatureExtractor(nn.Module):
             raise ValueError(f"Unsupported backbone: {backbone_name}")
 
         return_nodes = {l: l for l in self.layers}
+        self.channels = 0
+        for layer in self.layers:
+            block = getattr(backbone, layer)[-1]
+            self.channels += (block.bn3 if hasattr(block, "bn3") else block.bn2).num_features
         self.feature_extractor = create_feature_extractor(backbone, return_nodes=return_nodes)
         self.feature_extractor.eval()
         for p in self.feature_extractor.parameters():
@@ -89,18 +95,16 @@ class UpscalingFeatureExtractor(nn.Module):
         return self.pooler(fused)
 
     def get_channels_dim(self, probe_hw: Tuple[int, int] = (256, 256)) -> int:
-        self.feature_extractor.eval()
-        with torch.no_grad():
-            feats = self.feature_extractor(torch.rand(1, 3, probe_hw[0], probe_hw[1]))
-        return sum(v.shape[1] for v in feats.values())
+        # Channel metadata avoids allocating a full-resolution probe forward.
+        return self.channels
 
 
 class FeatureAdapter(nn.Module):
     """1x1 conv projection (linear per spatial location)."""
 
-    def __init__(self, channel_dim: int):
+    def __init__(self, channel_dim: int, output_channels: Optional[int] = None):
         super().__init__()
-        self.projection = nn.Conv2d(channel_dim, channel_dim, kernel_size=1, stride=1)
+        self.projection = nn.Conv2d(channel_dim, output_channels or channel_dim, kernel_size=1, stride=1)
         self.apply(_init_weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -245,23 +249,35 @@ class SuperSimpleNetModel(nn.Module):
         adapt_cls_features: bool = False,
         input_size: Tuple[int, int] = (256, 256),
         pretrained_backbone: bool = True,
+        dino_layers: Optional[List[int]] = None,
+        feature_channels: Optional[int] = None,
+        backbone_precision: str = "float32",
     ):
         super().__init__()
         self.input_size = tuple(input_size)
         self.adapt_cls_features = bool(adapt_cls_features)
         self.layers = list(layers) if layers is not None else ["layer2", "layer3"]
 
-        self.feature_extractor = UpscalingFeatureExtractor(
-            backbone_name=backbone_name,
-            layers=self.layers,
-            patch_size=3,
-            pretrained=pretrained_backbone,
-        )
+        self.is_dino = backbone_name in DINO_MODELS
+        if feature_channels is not None and (type(feature_channels) is not int or feature_channels < 1):
+            raise ValueError("feature_channels must be a positive integer.")
+        if feature_channels is not None and not self.adapt_cls_features:
+            raise ValueError("feature_channels requires adapt_cls_features=True for both heads.")
+        if self.is_dino:
+            self.feature_extractor = DinoFeatureExtractor(
+                backbone_name, layers=dino_layers if dino_layers is not None else [11],
+                pretrained=pretrained_backbone, precision=backbone_precision,
+            )
+        else:
+            self.feature_extractor = UpscalingFeatureExtractor(
+                backbone_name=backbone_name, layers=self.layers, patch_size=3,
+                pretrained=pretrained_backbone,
+            )
 
         channels = self.feature_extractor.get_channels_dim(probe_hw=self.input_size)
 
-        self.adaptor = FeatureAdapter(channels)
-        self.segdec = SegmentationDetectionModule(channel_dim=channels, stop_grad=stop_grad)
+        self.adaptor = FeatureAdapter(channels, feature_channels)
+        self.segdec = SegmentationDetectionModule(channel_dim=feature_channels or channels, stop_grad=stop_grad)
         self.anomaly_generator = AnomalyGenerator(noise_mean=0.0, noise_std=0.015, threshold=perlin_threshold)
         self.anomaly_map_generator = SSNAnomalyMapGenerator(sigma=4.0)
 
@@ -285,6 +301,12 @@ class SuperSimpleNetModel(nn.Module):
         generate_synthetic: Optional[bool] = None,
     ):
         out_hw = images.shape[-2:]
+        if self.is_dino:
+            images = pad_to_patch_grid(images)
+            if masks is not None:
+                if masks.shape[-2:] != out_hw:
+                    raise ValueError("Input masks must match the unpadded image dimensions.")
+                masks = pad_to_patch_grid(masks)
 
         features = self.feature_extractor(images)   # (B,C,Hf,Wf)
         adapted = self.adaptor(features)
@@ -329,6 +351,7 @@ class SuperSimpleNetModel(nn.Module):
         cls_feats = adapted if self.adapt_cls_features else features
         pred_map, pred_score = self.segdec(seg_features=seg_feats, cls_features=cls_feats)
 
-        pred_map = self.anomaly_map_generator(pred_map, final_size=out_hw).sigmoid()
+        pred_map = self.anomaly_map_generator(pred_map, final_size=images.shape[-2:]).sigmoid()
+        pred_map = pred_map[..., :out_hw[0], :out_hw[1]]
         pred_score = pred_score.sigmoid()
         return pred_map, pred_score

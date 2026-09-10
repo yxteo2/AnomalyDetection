@@ -281,14 +281,15 @@ class FastFlowModel(nn.Module):
     def _extract_features(self, x: torch.Tensor) -> List[torch.Tensor]:
         # ResNet forward manually for layer1/2/3 features
         net = self.backbone
-        x = net.conv1(x)
-        x = net.bn1(x)
-        x = net.relu(x)
-        x = net.maxpool(x)
+        with torch.no_grad():
+            x = net.conv1(x)
+            x = net.bn1(x)
+            x = net.relu(x)
+            x = net.maxpool(x)
 
-        f1 = net.layer1(x)  # scale /4
-        f2 = net.layer2(f1) # /8
-        f3 = net.layer3(f2) # /16
+            f1 = net.layer1(x)  # scale /4
+            f2 = net.layer2(f1) # /8
+            f3 = net.layer3(f2) # /16
 
         feats = [f1, f2, f3]
 
@@ -301,6 +302,11 @@ class FastFlowModel(nn.Module):
         if self.training:
             feats = [self.feat_drop[i](feat) for i, feat in enumerate(feats)]
         return feats
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.backbone.eval()
+        return self
 
     def forward(self, x: torch.Tensor, return_latents: Optional[bool] = None):
         # extract frozen features

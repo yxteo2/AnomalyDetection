@@ -60,10 +60,10 @@ slashes (`C:/datasets/MVTec`) or single-quoted backslash paths.
 
 | Selection | Options |
 | --- | --- |
-| `model.backbone` | `resnet18`, `resnet34`, `wide_resnet50_2` |
+| `model.backbone` | `resnet18`, `resnet34`, `wide_resnet50_2`; SSN additionally supports `dinov2_vits14`, `dinov2_vitb14` |
 | `model.name` | `fastflow`, `ssn` |
 | FastFlow `loss.name` | `fastflow_nll` |
-| SSN `loss.name` | `ssn_focal`, `ssn_bce` |
+| SSN `loss.name` | `ssn_focal`, `ssn_bce`, `ssn_bce_dice`, `ssn_focal_dice` |
 | `dataset.type` | `auto`, `mvtec`, `visa` |
 | `training.device` | `auto`, `cpu`, `cuda` |
 
@@ -73,11 +73,17 @@ a claimed performance improvement. Arbitrary combinations are invalid: flow
 latents/Jacobians and SSN segmentation/classification logits have different loss
 contracts. An incompatible combination is rejected before building a model.
 
-Both detectors support all three listed backbones. FastFlow uses ResNet stages
+Both detectors support the three ResNet backbones. FastFlow uses ResNet stages
 1–3; its `wide_resnet50_2` variant retains the existing channel reducers. SSN's
 feature stages are selectable. Pretrained initialization defaults to true;
 set `model.pretrained: false` for offline smoke tests. This is generally not a
 replacement for pretrained features in a real anomaly-detection experiment.
+
+For DINOv2, start with `configs/ssn_dinov2.yaml`. The frozen transformer returns
+patch-grid features, not ResNet stages. Bottom/right padding preserves coordinates
+at non-multiples of 14, and output maps are cropped back to the requested size.
+See [DINOv2 and GPU memory](gpu_memory.md) for the 416/512/704 configuration and
+memory test. DINOv2 + FastFlow is explicitly rejected, not silently substituted.
 
 ## Configuration sections
 
@@ -89,7 +95,7 @@ duplicate keys, invalid types and unsupported combinations produce errors.
 | `dataset` | `path` and `category` (required); `type`, `val_ratio` |
 | `model` | `name`, `backbone`, `pretrained`, `image_size`, `crop_scale`, `params` |
 | `loss` | `name`, `params` |
-| `training` | `epochs`, `batch_size`, `learning_rate`, `weight_decay`, `patience`, `num_workers`, `seed`, `device`; SSN-only `head_lr_multiplier`, `adaptor_weight_decay` |
+| `training` | `epochs`, `batch_size`, `accumulate_grad_batches`, `learning_rate`, `weight_decay`, `patience`, `num_workers`, `seed`, `device`; SSN-only `head_lr_multiplier`, `adaptor_weight_decay` |
 | `evaluation` | `image_threshold_quantile`, `pixel_threshold_quantile`, `num_visualizations` |
 | `output` | `save_dir`, `run_name`, `overwrite` |
 
@@ -104,9 +110,14 @@ normal training images to make separate training and validation subsets.
 | --- | --- |
 | FastFlow | `flow_steps: 8`, `hidden_ratio: 1.0`, `clamp: 2.0`, `conv3x3_only: false` |
 | SSN | `layers: [layer2, layer3]`, `perlin_threshold: 0.2`, `adapt_cls_features: false` |
+| SSN memory controls | `feature_channels: null` (positive integer requires `adapt_cls_features: true`) |
+| SSN DINOv2 | `dino_layers: [11]` (ordered unique block indices 0–11), `backbone_precision: float32` (`bfloat16` optionally runs the frozen backbone in BF16 on CUDA) |
 
 SSN layers must be unique members of `layer1` through `layer4`, in shallow-to-deep
-order. Parameters belonging to the other detector are rejected.
+order. They are ResNet-only selectors; DINO uses `dino_layers`. The DINO selectors
+retain their defaults when using ResNet. Parameters belonging to the other
+detector are rejected. CPU DINO extraction always uses FP32; heads and losses
+remain FP32 on both CPU and GPU.
 
 ### Loss parameters
 
@@ -114,7 +125,9 @@ order. Parameters belonging to the other detector are rejected.
 | --- | --- |
 | `fastflow_nll` | None; sums Gaussian NLL minus log-Jacobian across feature levels |
 | `ssn_focal` | `gamma: 4.0`, `alpha: -1.0`, `truncation_term: 0.5`, `seg_weight: 1.0`, `cls_weight: 1.0`, `truncation_weight: 1.0` |
-| `ssn_bce` | `seg_weight: 1.0`, `cls_weight: 1.0` |
+| `ssn_bce` | `seg_weight: 1.0`, `cls_weight: 1.0`, `seg_pos_weight: 1.0`, `cls_pos_weight: 1.0` |
+| `ssn_bce_dice` | BCE parameters plus `dice_weight: 1.0`, `dice_smooth: 1e-6` |
+| `ssn_focal_dice` | Focal parameters plus `dice_weight: 1.0`, `dice_smooth: 1e-6`; `truncation_weight` defaults to `0.0` |
 
 SSN focal loss is the weighted sum of map focal loss, image focal loss and
 truncation loss on map probabilities. SSN BCE uses binary cross entropy with
@@ -169,3 +182,24 @@ To add a new component in Python, extend the schema/compatibility tables and the
 matching factory, implement the required trainer/evaluator contract, and add
 validation and training tests. Merely adding an arbitrary name to YAML is not
 enough to support a new architecture.
+
+## Additional loss and accumulation choices
+
+`seg_pos_weight` and `cls_pos_weight` multiply positive-target BCE terms; they
+must be positive and are independent of the overall segmentation/classification
+weights. No weights are estimated from the test set. Choose them using training
+data and a predefined validation protocol, rather than assuming a large value
+will improve results.
+
+The Dice variants add a per-image soft segmentation Dice term:
+`1 - (2 * sum(sigmoid(logits) * mask) + smooth) / (sum(sigmoid(logits)) + sum(mask) + smooth)`.
+Classification still uses BCE or focal, respectively. Dice reductions are FP32,
+`dice_smooth` is positive, and empty masks are handled without division by zero.
+These are experimental objectives, not established accuracy improvements.
+
+`training.accumulate_grad_batches` defaults to 1. Larger values accumulate
+sample-weighted gradients without retaining earlier microbatch graphs; the last
+partial window is still stepped. BatchNorm and synthetic anomaly generation mean
+this is not identical to increasing the physical batch size. Full-precision
+training remains the default; the optional BF16 setting applies only to the
+frozen DINO backbone, not the trainable heads or FastFlow likelihood calculations.

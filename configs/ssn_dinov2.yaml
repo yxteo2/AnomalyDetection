@@ -1,0 +1,42 @@
+# python train.py --config configs/ssn_dinov2.yaml
+# Conservative STARTING profile, not a measured 16 GB guarantee.
+dataset:
+  path: ../data/MVTec
+  category: bottle
+
+model:
+  name: ssn
+  backbone: dinov2_vits14  # Also dinov2_vitb14; higher memory cost.
+  pretrained: true
+  image_size: [512, 512]  # Also [416, 416], [704, 704], or rectangular sizes.
+  crop_scale: 1.0         # Preserve the full resized field of view.
+  params:
+    dino_layers: [11]     # Zero-based transformer block indices, not ResNet stages.
+    feature_channels: 128
+    adapt_cls_features: true
+    backbone_precision: bfloat16  # CUDA only; CPU uses float32.
+
+loss:
+  name: ssn_bce_dice      # ssn_bce | ssn_focal | ssn_bce_dice | ssn_focal_dice
+  params:
+    seg_weight: 1.0
+    cls_weight: 1.0
+    seg_pos_weight: 1.0
+    cls_pos_weight: 1.0
+    dice_weight: 1.0
+
+training:
+  device: cuda           # Fail explicitly if CUDA is missing; never silently use CPU.
+  batch_size: 1
+  accumulate_grad_batches: 4
+  epochs: 100
+  num_workers: 0         # Conservative host RAM / Windows starting setting.
+  learning_rate: 0.0001
+
+evaluation:
+  num_visualizations: 0
+
+output:
+  save_dir: ../checkpoints
+  run_name: dinov2_512_bce_dice
+  overwrite: false

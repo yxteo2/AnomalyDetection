@@ -4,6 +4,12 @@ PyTorch implementations of FastFlow and SuperSimpleNet (SSN) for image-level
 and pixel-level industrial anomaly detection. The data loader supports MVTec AD,
 MVTec-style folders and the original VisA layout.
 
+SSN also supports frozen **DINOv2 ViT-S/14 and ViT-B/14** backbones with automatic
+patch-grid padding for 416, 512, 704 and rectangular image sizes. Start with
+`configs/ssn_dinov2.yaml`; see the [GPU and memory guide](docs/gpu_memory.md) for
+the conservative RTX 5070 Ti profile and the actual CUDA memory smoke test.
+DINOv2 is not yet supported by this repository's FastFlow implementation.
+
 ## Repository layout
 
 | Path | Purpose |
@@ -13,12 +19,16 @@ MVTec-style folders and the original VisA layout.
 | `ssn_inference.py` | SuperSimpleNet inference, metrics and visualizations |
 | `anomaly_detection/data.py` | MVTec, MVTec-style and VisA dataset loading |
 | `anomaly_detection/modeling/` | FastFlow and SuperSimpleNet implementations |
+| `anomaly_detection/modeling/dinov2.py` | Frozen timm DINOv2 features and patch-grid padding |
 | `anomaly_detection/training/` | Model-specific training and evaluation utilities |
 | `anomaly_detection/builder.py` | Configuration-driven model, loss and trainer factories |
 | `anomaly_detection/config.py` | YAML schema, defaults and validation |
 | `anomaly_detection/pipeline.py` | Shared experiment lifecycle |
+| `anomaly_detection/smoke.py` | Synthetic training/reload and CUDA peak-memory checks |
+| `anomaly_detection/training/accumulation.py` | Sample-weighted gradient accumulation |
 | `configs/` | Ready-to-edit FastFlow, SSN focal and SSN BCE YAML experiments |
 | `docs/yaml_training.md` | YAML options, supported combinations and extension guide |
+| `docs/gpu_memory.md` | DINOv2, larger inputs and GPU memory configuration |
 | `tests/` | Regression tests for evaluation and model behavior |
 
 ## Installation
