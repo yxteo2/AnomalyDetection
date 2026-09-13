@@ -65,6 +65,7 @@ def test_fastflow_train_and_eval_output_contracts():
     )
     images = torch.rand(1, 3, 32, 32)
     model.train()
+    assert not model.backbone.training
     hidden, jacobians = model(images)
     assert len(hidden) == len(jacobians) == 3
 

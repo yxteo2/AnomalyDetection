@@ -4,7 +4,7 @@ import argparse
 
 import yaml
 
-from anomaly_detection.config import BACKBONES, ConfigError, as_yaml_config, load_config, resolve_config
+from anomaly_detection.config import BACKBONES, LOSS_DEFAULTS, MODEL_PARAMS, ConfigError, as_yaml_config, load_config, resolve_config
 
 
 def parse_args(argv=None):
@@ -16,7 +16,7 @@ def parse_args(argv=None):
     parser.add_argument("--check-config", action="store_true", help="Validate and print resolved settings without training.")
     parser.add_argument("--data_path")
     parser.add_argument("--category")
-    parser.add_argument("--model", choices=["fastflow", "ssn"])
+    parser.add_argument("--model", choices=MODEL_PARAMS)
     parser.add_argument("--backbone", choices=BACKBONES)
     parser.add_argument("--image_size", type=int, nargs=2)
     parser.add_argument("--crop_scale", type=float)
@@ -39,7 +39,8 @@ def parse_args(argv=None):
     parser.add_argument("--save_dir")
     parser.add_argument("--run_name")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"])
-    parser.add_argument("--loss", dest="loss_name", choices=["fastflow_nll", "ssn_focal", "ssn_bce"])
+    parser.add_argument("--loss", dest="loss_name", choices=LOSS_DEFAULTS)
+    parser.add_argument("--accumulate_grad_batches", type=int)
     parser.add_argument("--overwrite", action="store_true")
     args = vars(parser.parse_args(argv))
     config_path = args.pop("config", None)

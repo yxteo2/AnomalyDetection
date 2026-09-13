@@ -56,12 +56,42 @@ class SSNLoss(nn.Module):
 class SSNBCELoss(nn.Module):
     """Weighted segmentation/classification BCE on logits, for SSN ablations."""
 
-    def __init__(self, seg_weight=1.0, cls_weight=1.0):
+    def __init__(self, seg_weight=1.0, cls_weight=1.0, seg_pos_weight=1.0, cls_pos_weight=1.0):
         super().__init__()
         self.seg_weight = float(seg_weight)
         self.cls_weight = float(cls_weight)
+        self.register_buffer("seg_pos_weight", torch.tensor(float(seg_pos_weight)))
+        self.register_buffer("cls_pos_weight", torch.tensor(float(cls_pos_weight)))
 
     def forward(self, pred_map_logits, pred_score_logits, target_mask, target_label):
-        segmentation = F.binary_cross_entropy_with_logits(pred_map_logits, target_mask)
-        classification = F.binary_cross_entropy_with_logits(pred_score_logits, target_label)
+        segmentation = F.binary_cross_entropy_with_logits(pred_map_logits, target_mask, pos_weight=self.seg_pos_weight)
+        classification = F.binary_cross_entropy_with_logits(pred_score_logits, target_label, pos_weight=self.cls_pos_weight)
         return self.seg_weight * segmentation + self.cls_weight * classification
+
+
+def soft_dice_loss(logits, target, smooth=1e-6):
+    """Per-image soft Dice on segmentation probabilities; reductions stay FP32."""
+    probability = logits.float().sigmoid().flatten(1)
+    target = target.float().flatten(1)
+    overlap = (probability * target).sum(1)
+    return (1 - (2 * overlap + smooth) / (probability.sum(1) + target.sum(1) + smooth)).mean()
+
+
+class SSNBCEDiceLoss(SSNBCELoss):
+    def __init__(self, dice_weight=1.0, dice_smooth=1e-6, **kwargs):
+        super().__init__(**kwargs)
+        self.dice_weight, self.dice_smooth = float(dice_weight), float(dice_smooth)
+
+    def forward(self, pred_map_logits, pred_score_logits, target_mask, target_label):
+        return (super().forward(pred_map_logits, pred_score_logits, target_mask, target_label)
+                + self.dice_weight * soft_dice_loss(pred_map_logits, target_mask, self.dice_smooth))
+
+
+class SSNFocalDiceLoss(SSNLoss):
+    def __init__(self, dice_weight=1.0, dice_smooth=1e-6, truncation_weight=0.0, **kwargs):
+        super().__init__(truncation_weight=truncation_weight, **kwargs)
+        self.dice_weight, self.dice_smooth = float(dice_weight), float(dice_smooth)
+
+    def forward(self, pred_map_logits, pred_score_logits, target_mask, target_label):
+        return (super().forward(pred_map_logits, pred_score_logits, target_mask, target_label)
+                + self.dice_weight * soft_dice_loss(pred_map_logits, target_mask, self.dice_smooth))

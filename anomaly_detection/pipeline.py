@@ -97,6 +97,7 @@ class AnomalyPipeline:
             dataset_type=self.cfg["dataset_type"],
             val_ratio=float(self.cfg["val_ratio"]),
             seed=int(self.cfg["seed"]),
+            pin_memory=self.device.type == "cuda",
         )
         self.data_module.setup()
 
@@ -128,6 +129,8 @@ class AnomalyPipeline:
     def train(self):
         print("\n=== Starting Training ===")
         train_loader = self.data_module.train_dataloader()
+        if self.cfg["model"] in ("padim", "patchcore"):
+            train_loader = self.data_module.fit_dataloader()
         val_loader = self.data_module.val_dataloader()
 
         self.trainer.fit(
@@ -139,9 +142,13 @@ class AnomalyPipeline:
 
     def evaluate(self) -> Dict[str, Any]:
         print("\n=== Evaluating ===")
-        self.trainer.load_checkpoint("best_model.pth")
+        # Evaluation needs neither gradients nor Adam momentum buffers on GPU.
+        if self.trainer.optimizer is not None:
+            self.trainer.optimizer.zero_grad(set_to_none=True)
+            self.trainer.optimizer.state.clear()
+        self.trainer.load_checkpoint("best_model.pth", load_optimizer=False)
 
-        if self.cfg["model"] == "ssn":
+        if self.cfg["model"] != "fastflow":
             self.evaluator = SuperSimpleNetEvaluator(model=self.model, device=str(self.device))
         else:
             self.evaluator = FastFlowEvaluator(model=self.model, device=str(self.device))
@@ -154,6 +161,7 @@ class AnomalyPipeline:
             image_quantile=float(self.cfg["image_threshold_quantile"]),
             pixel_quantile=float(self.cfg["pixel_threshold_quantile"]),
         )
+        del val_preds  # Do not retain validation maps alongside all test maps in RAM.
         with open(self.save_dir / "calibration.json", "w", encoding="utf-8") as f:
             json.dump(calibration, f, indent=4)
 

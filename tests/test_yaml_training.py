@@ -89,16 +89,19 @@ def make_dataset(root):
     Image.fromarray(mask).save(mask_dir / "000_mask.png")
 
 
-@pytest.mark.parametrize("model_name,loss_name", [
-    ("fastflow", "fastflow_nll"), ("ssn", "ssn_focal"), ("ssn", "ssn_bce"),
+@pytest.mark.parametrize("model_name,loss_name,backbone", [
+    ("fastflow", "fastflow_nll", "resnet18"), ("ssn", "ssn_focal", "resnet18"),
+    ("ssn", "ssn_bce", "resnet18"), ("ssn", "ssn_bce_dice", "dinov2_vits14"),
+    ("ssn", "ssn_focal_dice", "dinov2_vits14"),
+    ("fastflow", "fastflow_nll", "dinov2_vits14"),
 ])
-def test_yaml_runs_real_training_and_existing_inference(tmp_path, monkeypatch, model_name, loss_name):
+def test_yaml_runs_real_training_and_existing_inference(tmp_path, monkeypatch, model_name, loss_name, backbone):
     make_dataset(tmp_path / "data")
     loss_params = {} if model_name == "fastflow" else {"seg_weight": 2.0, "cls_weight": 0.5}
     doc = {
         "dataset": {"path": "data", "category": "bottle", "val_ratio": 0.25},
         "model": {
-            "name": model_name, "backbone": "resnet18", "pretrained": False, "image_size": [32, 32],
+            "name": model_name, "backbone": backbone, "pretrained": False, "image_size": [32, 32],
             "params": {"flow_steps": 1} if model_name == "fastflow" else {"layers": ["layer2", "layer3"]},
         },
         "loss": {"name": loss_name, "params": loss_params},
@@ -111,6 +114,12 @@ def test_yaml_runs_real_training_and_existing_inference(tmp_path, monkeypatch, m
     }
     if model_name == "ssn":
         doc["training"].update(head_lr_multiplier=3.0, adaptor_weight_decay=0.005)
+    if backbone.startswith("dinov2"):
+        doc["model"]["params"].update(feature_channels=128, dino_layers=[11],
+                                       backbone_precision="bfloat16")
+        if model_name == "ssn":
+            doc["model"]["params"]["adapt_cls_features"] = True
+        doc["training"]["accumulate_grad_batches"] = 3  # Flush final two-batch partial window.
     path = tmp_path / "experiment.yaml"
     path.write_text(yaml.safe_dump(doc), encoding="utf-8")
 
@@ -130,7 +139,7 @@ def test_yaml_runs_real_training_and_existing_inference(tmp_path, monkeypatch, m
     assert np.isfinite(metrics["image_auroc"])
     assert np.isfinite(metrics["pixel_auroc"])
 
-    output = tmp_path / "runs/bottle" / model_name / "resnet18/smoke"
+    output = tmp_path / "runs/bottle" / model_name / backbone / "smoke"
     checkpoint_path = output / "best_model.pth"
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     assert checkpoint["history"]["epoch"] == 1
@@ -163,7 +172,7 @@ def test_yaml_runs_real_training_and_existing_inference(tmp_path, monkeypatch, m
                                          topk_ratio=0.01, **common)
     else:
         engine = SSNInferenceEngine(perlin_threshold=0.7, adapt_cls_features=True, layers=["layer1"], **common)
-    assert engine.backbone == "resnet18"
+    assert engine.backbone == backbone
     assert engine.image_size == (32, 32)
     score, anomaly_map, _ = engine.infer_one(str(tmp_path / "data/bottle/test/good/000.png"))
     assert np.isfinite(score) and np.isfinite(anomaly_map).all()

@@ -6,11 +6,15 @@ Factories are explicit allowlists: YAML never imports or executes arbitrary code
 from anomaly_detection.config import resolve_config
 from anomaly_detection.modeling import FastFlowModel, SuperSimpleNetModel
 from anomaly_detection.training import FastFlowTrainer, SuperSimpleNetTrainer
-from anomaly_detection.training.losses import FastFlowNLLLoss, SSNBCELoss, SSNLoss
+from anomaly_detection.training.losses import FastFlowNLLLoss, SSNBCELoss, SSNLoss, SSNBCEDiceLoss, SSNFocalDiceLoss
+from anomaly_detection.modeling.feature_heads import PadimModel, PatchcoreModel, DinomalyModel
+from anomaly_detection.training.feature_heads import FeatureHeadTrainer, ReconstructionLoss
 
 
 MODEL_BUILDERS = {"fastflow": FastFlowModel, "ssn": SuperSimpleNetModel}
+MODEL_BUILDERS.update(padim=PadimModel, patchcore=PatchcoreModel, dinomaly=DinomalyModel)
 LOSS_BUILDERS = {"fastflow_nll": FastFlowNLLLoss, "ssn_focal": SSNLoss, "ssn_bce": SSNBCELoss}
+LOSS_BUILDERS.update(ssn_bce_dice=SSNBCEDiceLoss, ssn_focal_dice=SSNFocalDiceLoss)
 
 
 def model_kwargs(cfg):
@@ -20,13 +24,19 @@ def model_kwargs(cfg):
         "backbone_name": cfg["backbone"],
         "input_size": tuple(cfg["image_size"]),
         "pretrained_backbone": cfg["pretrained_backbone"],
+        **{key: cfg[key] for key in ("dino_layers", "feature_channels", "backbone_precision")},
     }
     if cfg["model"] == "fastflow":
         kwargs.update({key: cfg[key] for key in ("flow_steps", "hidden_ratio", "clamp", "conv3x3_only")})
-        kwargs["reducer_channels"] = (128, 192, 256) if cfg["backbone"] == "wide_resnet50_2" else None
-    else:
+        kwargs["reducer_channels"] = ((128, 192, 256)
+                                     if cfg["backbone"] == "wide_resnet50_2" and cfg["feature_channels"] is None else None)
+    elif cfg["model"] == "ssn":
         kwargs.update({key: cfg[key] for key in ("perlin_threshold", "layers", "adapt_cls_features")})
         kwargs["stop_grad"] = True
+    else:
+        from anomaly_detection.config import MODEL_PARAMS
+        kwargs.pop("feature_channels")
+        kwargs.update({key: cfg[key] for key in MODEL_PARAMS[cfg["model"]]})
     return kwargs
 
 
@@ -37,6 +47,10 @@ def build_model(cfg):
 
 def build_loss(cfg):
     cfg = resolve_config(cfg)
+    if cfg["loss_name"] == "none":
+        return None
+    if cfg["model"] == "dinomaly":
+        return ReconstructionLoss(name=cfg["loss_name"], **cfg["loss_params"])
     return LOSS_BUILDERS[cfg["loss_name"]](**cfg["loss_params"])
 
 
@@ -48,9 +62,12 @@ def build_trainer(cfg, model, device, save_dir):
         "model_cfg": {**model_kwargs(cfg), "crop_scale": cfg["crop_scale"]},
         "loss_fn": build_loss(cfg), "experiment_cfg": cfg,
         "monitor": "val_loss", "maximize": False,
+        "accumulate_grad_batches": cfg["accumulate_grad_batches"],
     }
     if cfg["model"] == "fastflow":
         return FastFlowTrainer(backbone_name=cfg["backbone"], **kwargs)
+    if cfg["model"] in ("padim", "patchcore", "dinomaly"):
+        return FeatureHeadTrainer(**kwargs)
     return SuperSimpleNetTrainer(
         head_lr_multiplier=cfg["head_lr_multiplier"],
         adaptor_weight_decay=cfg["adaptor_weight_decay"], **kwargs,

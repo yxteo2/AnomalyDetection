@@ -21,6 +21,7 @@ from torch.optim.lr_scheduler import MultiStepLR
 from tqdm import tqdm
 
 from anomaly_detection.training.losses import SSNLoss
+from anomaly_detection.training.accumulation import GradientAccumulator
 
 
 # =============================================================================
@@ -101,6 +102,7 @@ class SuperSimpleNetTrainer:
         adaptor_weight_decay: float = 0.01,
         loss_fn: Optional[nn.Module] = None,
         experiment_cfg: Optional[Dict[str, Any]] = None,
+        accumulate_grad_batches: int = 1,
     ):
         self.model = model.to(device)
         self.device = device
@@ -113,6 +115,7 @@ class SuperSimpleNetTrainer:
 
         self.model_cfg = model_cfg or {}
         self.experiment_cfg = experiment_cfg or {}
+        self.accumulate_grad_batches = accumulate_grad_batches
 
         # anomalib-style optimizer: two param groups
         adaptor_params = list(getattr(self.model, "adaptor").parameters())
@@ -141,6 +144,7 @@ class SuperSimpleNetTrainer:
         total = 0.0
         n = 0
 
+        accumulator = GradientAccumulator(self.optimizer, self.accumulate_grad_batches, max_norm=1.0)
         pbar = tqdm(dataloader, desc="Training(SSN)")
         for batch in pbar:
             images = batch["image"].to(self.device)
@@ -158,15 +162,13 @@ class SuperSimpleNetTrainer:
             )
             loss = self.loss_fn(pred_map_logits, pred_score_logits, tgt_mask, tgt_label)
 
-            self.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
+            accumulator.backward(loss, images.shape[0])
 
             total += float(loss.item())
             n += 1
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
+        accumulator.step()
         return total / max(1, n)
 
     @torch.no_grad()
@@ -223,14 +225,14 @@ class SuperSimpleNetTrainer:
         }
         torch.save(ckpt, self.save_dir / filename)
 
-    def load_checkpoint(self, filename: str, strict: bool = True):
-        ckpt = torch.load(self.save_dir / filename, map_location=self.device)
+    def load_checkpoint(self, filename: str, strict: bool = True, load_optimizer: bool = True):
+        ckpt = torch.load(self.save_dir / filename, map_location="cpu", weights_only=True)
 
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
             state = _strip_prefix_if_present(ckpt["model_state_dict"])
             self.model.load_state_dict(state, strict=strict)
 
-            if "optimizer_state_dict" in ckpt:
+            if load_optimizer and "optimizer_state_dict" in ckpt:
                 self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             if "history" in ckpt:
                 self.history = ckpt["history"]
