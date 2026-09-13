@@ -7,7 +7,6 @@
 
 import argparse
 import json
-import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -15,7 +14,7 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 import torch
-from PIL import Image
+from anomaly_detection.preprocessing import InferencePreprocessing
 
 from anomaly_detection.modeling import FastFlowModel
 
@@ -361,7 +360,7 @@ class Sample:
     gt_mask_orig: Optional[np.ndarray]
 
 
-class FastFlowInferenceEngine:
+class FastFlowInferenceEngine(InferencePreprocessing):
     def __init__(
         self,
         checkpoint_path: str,
@@ -379,8 +378,10 @@ class FastFlowInferenceEngine:
         feature_channels: Optional[int] = None,
         backbone_precision: Optional[str] = None,
     ):
-        self.device = torch.device(device if (device == "cuda" and torch.cuda.is_available()) else "cpu")
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        if device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested, but is unavailable.")
+        self.device = torch.device(device)
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         model_cfg = ckpt.get("model_cfg", {}) if isinstance(ckpt, dict) else {}
         backbone = model_cfg.get("backbone_name", backbone)
         flow_steps = int(model_cfg.get("flow_steps", flow_steps))
@@ -418,30 +419,7 @@ class FastFlowInferenceEngine:
         self.model.to(self.device)
         self.model.eval()
 
-        from torchvision.transforms import v2 as T
-
-        h, w = self.image_size
-        pre_h = int(math.ceil(h / crop_scale))
-        pre_w = int(math.ceil(w / crop_scale))
-
-        self.h, self.w = h, w
-        self.pre_h, self.pre_w = pre_h, pre_w
-        self.crop_top = (pre_h - h) // 2
-        self.crop_left = (pre_w - w) // 2
-
-        self.transform = T.Compose([
-            T.ToImage(),
-            T.Resize((pre_h, pre_w), antialias=True),
-            T.CenterCrop((h, w)),
-            T.ToDtype(torch.float32, scale=True),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-
-    def preprocess(self, image_path: str) -> Tuple[torch.Tensor, np.ndarray]:
-        pil = Image.open(image_path).convert("RGB")
-        orig_rgb = np.array(pil)
-        x = self.transform(pil).unsqueeze(0)
-        return x, orig_rgb
+        self.setup_preprocessing(self.image_size, crop_scale)
 
     @torch.inference_mode()
     def get_anomaly_map(self, x: torch.Tensor) -> torch.Tensor:
@@ -465,22 +443,6 @@ class FastFlowInferenceEngine:
         amap_np = amap[0, 0].detach().cpu().numpy().astype(np.float32)
         return score_val, amap_np, orig_rgb
 
-    def gt_mask_to_crop(self, gt_mask_orig: np.ndarray, orig_rgb: np.ndarray) -> np.ndarray:
-        H0, W0 = orig_rgb.shape[:2]
-        m = gt_mask_orig
-        if m.shape[:2] != (H0, W0):
-            m = cv2.resize(m, (W0, H0), interpolation=cv2.INTER_NEAREST)
-        m = cv2.resize(m, (self.pre_w, self.pre_h), interpolation=cv2.INTER_NEAREST)
-        t, l = self.crop_top, self.crop_left
-        m = m[t : t + self.h, l : l + self.w]
-        return ((m > 0).astype(np.uint8) * 255)
-
-    def uncrop_mask_to_original(self, orig_rgb: np.ndarray, mask_hw: np.ndarray) -> np.ndarray:
-        H0, W0 = orig_rgb.shape[:2]
-        canvas = np.zeros((self.pre_h, self.pre_w), dtype=np.uint8)
-        t, l = self.crop_top, self.crop_left
-        canvas[t : t + self.h, l : l + self.w] = mask_hw
-        return cv2.resize(canvas, (W0, H0), interpolation=cv2.INTER_NEAREST)
 
     def save_contour_overlay(
         self,
@@ -749,6 +711,7 @@ def main():
     parser.add_argument("--backbone", type=str, default="resnet18")
     parser.add_argument("--flow_steps", type=int, default=8)
     parser.add_argument("--image_size", type=int, nargs=2, default=[416, 416])  # H W
+    parser.add_argument("--crop_scale", type=float, default=0.875, help="Legacy checkpoint fallback; saved crop_scale takes precedence.")
     parser.add_argument("--hidden_ratio", type=float, default=1.0)
     parser.add_argument("--clamp", type=float, default=2.0)
     parser.add_argument("--conv3x3_only", action="store_true")
@@ -783,6 +746,7 @@ def main():
         backbone=args.backbone,
         flow_steps=args.flow_steps,
         image_size=tuple(args.image_size),
+        crop_scale=args.crop_scale,
         hidden_ratio=args.hidden_ratio,
         clamp=args.clamp,
         conv3x3_only=args.conv3x3_only,

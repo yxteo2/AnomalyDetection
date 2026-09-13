@@ -9,7 +9,7 @@ from typing import Dict, Any
 import numpy as np
 import torch
 import yaml
-from torchvision.transforms import v2 as T
+from anomaly_detection.preprocessing import make_det_tf, make_train_tf
 
 from anomaly_detection.builder import build_model, build_trainer
 from anomaly_detection.config import as_yaml_config, resolve_config
@@ -18,33 +18,6 @@ from anomaly_detection.training import (
     FastFlowEvaluator,
     SuperSimpleNetEvaluator,
 )
-
-
-# -----------------------------
-# Transforms (torchvision v2)
-# -----------------------------
-def make_train_tf(pre_h: int, pre_w: int, h: int, w: int):
-    return T.Compose([
-        T.ToImage(),
-        T.Resize((pre_h, pre_w), antialias=True),
-        T.CenterCrop((h, w)),
-        T.RandomHorizontalFlip(p=0.5),
-        T.RandomVerticalFlip(p=0.5),
-        T.ToDtype(torch.float32, scale=True),
-        T.Normalize(mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]),
-    ])
-
-
-def make_det_tf(pre_h: int, pre_w: int, h: int, w: int):
-    return T.Compose([
-        T.ToImage(),
-        T.Resize((pre_h, pre_w), antialias=True),
-        T.CenterCrop((h, w)),
-        T.ToDtype(torch.float32, scale=True),
-        T.Normalize(mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]),
-    ])
 
 
 # -----------------------------
