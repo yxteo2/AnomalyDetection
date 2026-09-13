@@ -1,0 +1,28 @@
+# Experimental DINO features + PaDiM statistics; one fitting pass, no loss.
+dataset:
+  path: ../data/MVTec
+  category: bottle
+model:
+  name: padim
+  backbone: dinov2_vits14
+  pretrained: true
+  image_size: [512, 512]
+  crop_scale: 1.0
+  params:
+    dino_layers: [11]
+    backbone_precision: bfloat16
+    padim_channels: 32
+    covariance_regularization: 0.01
+    fit_memory_mb: 512
+loss:
+  name: none
+training:
+  device: cuda
+  batch_size: 1
+  epochs: 1
+  num_workers: 0
+evaluation:
+  num_visualizations: 0
+output:
+  save_dir: ../checkpoints
+  run_name: padim_dino_512

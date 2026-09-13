@@ -1,0 +1,36 @@
+# Frozen DINOv2 + FastFlow variant. Measure memory before full training.
+dataset:
+  path: ../data/MVTec
+  category: bottle
+
+model:
+  name: fastflow
+  backbone: dinov2_vits14
+  pretrained: true
+  image_size: [512, 512]  # Also 416, 704, and rectangular sizes.
+  crop_scale: 1.0
+  params:
+    dino_layers: [11]
+    feature_channels: 128
+    backbone_precision: bfloat16  # Frozen backbone only; flow and NLL remain FP32.
+    flow_steps: 4
+    hidden_ratio: 1.0
+
+loss:
+  name: fastflow_nll
+
+training:
+  device: cuda
+  batch_size: 1
+  accumulate_grad_batches: 4
+  epochs: 100
+  num_workers: 0
+  learning_rate: 0.0001
+
+evaluation:
+  num_visualizations: 0
+
+output:
+  save_dir: ../checkpoints
+  run_name: fastflow_dinov2_512
+  overwrite: false

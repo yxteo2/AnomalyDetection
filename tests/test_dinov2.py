@@ -84,7 +84,7 @@ def test_base_backbone_and_multiple_blocks():
 
 
 @pytest.mark.parametrize("changes", [
-    {"model": "fastflow"}, {"dino_layers": []}, {"dino_layers": [12]},
+    {"model": "fastflow", "feature_channels": 127}, {"dino_layers": []}, {"dino_layers": [12]},
     {"dino_layers": [11, 8]}, {"dino_layers": [True]}, {"feature_channels": 0},
     {"adapt_cls_features": False}, {"backbone_precision": "float16"},
     {"accumulate_grad_batches": 0}, {"accumulate_grad_batches": True},
@@ -97,10 +97,12 @@ def test_invalid_extensions_fail_before_model_construction(changes):
         dino_config(**changes)
 
 
-def test_example_roundtrip(tmp_path):
+@pytest.mark.parametrize("example", ["ssn_dinov2.yaml", "fastflow_dinov2.yaml", "padim_dinov2.yaml",
+                                    "patchcore_dinov2.yaml", "dinomaly_dinov2.yaml"])
+def test_example_roundtrip(tmp_path, example):
     import yaml
 
-    cfg = load_config(Path(__file__).resolve().parents[1] / "configs/ssn_dinov2.yaml")
+    cfg = load_config(Path(__file__).resolve().parents[1] / "configs" / example)
     path = tmp_path / "resolved.yaml"
     path.write_text(yaml.safe_dump(as_yaml_config(cfg)))
     assert load_config(path) == cfg

@@ -4,7 +4,7 @@ import argparse
 
 import yaml
 
-from anomaly_detection.config import BACKBONES, LOSS_DEFAULTS, ConfigError, as_yaml_config, load_config, resolve_config
+from anomaly_detection.config import BACKBONES, LOSS_DEFAULTS, MODEL_PARAMS, ConfigError, as_yaml_config, load_config, resolve_config
 
 
 def parse_args(argv=None):
@@ -16,7 +16,7 @@ def parse_args(argv=None):
     parser.add_argument("--check-config", action="store_true", help="Validate and print resolved settings without training.")
     parser.add_argument("--data_path")
     parser.add_argument("--category")
-    parser.add_argument("--model", choices=["fastflow", "ssn"])
+    parser.add_argument("--model", choices=MODEL_PARAMS)
     parser.add_argument("--backbone", choices=BACKBONES)
     parser.add_argument("--image_size", type=int, nargs=2)
     parser.add_argument("--crop_scale", type=float)

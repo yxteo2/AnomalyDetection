@@ -56,8 +56,12 @@ def run_smoke(cfg, device="cuda", memory_budget_gb=14.0):
     with TemporaryDirectory(prefix="anomaly-smoke-") as temporary:
         model = build_model(cfg)
         trainer = build_trainer(cfg, model, device, Path(temporary))
-        loss = trainer.train_epoch(SyntheticBatches(cfg))
-        if not math.isfinite(loss):
+        loss = None
+        if cfg["model"] in ("padim", "patchcore"):
+            trainer.fit_statistics(SyntheticBatches(cfg))
+        else:
+            loss = trainer.train_epoch(SyntheticBatches(cfg))
+        if loss is not None and not math.isfinite(loss):
             raise RuntimeError("Training produced a non-finite loss.")
         frozen = model.feature_extractor if cfg["model"] == "ssn" else model.backbone
         if any(p.requires_grad or p.grad is not None for p in frozen.parameters()):
@@ -70,8 +74,9 @@ def run_smoke(cfg, device="cuda", memory_budget_gb=14.0):
         if any(not torch.isfinite(x).all() for x in expected):
             raise RuntimeError("Inference produced non-finite outputs.")
         trainer.save_checkpoint("smoke.pth")
-        trainer.optimizer.zero_grad(set_to_none=True)
-        trainer.optimizer.state.clear()
+        if trainer.optimizer is not None:
+            trainer.optimizer.zero_grad(set_to_none=True)
+            trainer.optimizer.state.clear()
         # Do not keep two complete models or optimizer states on the GPU at reload.
         del prediction, trainer, model, frozen
         gc.collect()

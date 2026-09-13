@@ -400,6 +400,7 @@ class MVTecDataModule:
         # Separate dataset instances keep augmentation confined to training while
         # validation uses the same deterministic preprocessing as testing.
         self.train_dataset = Subset(train_augmented, train_indices)
+        self.fit_dataset = Subset(train_deterministic, train_indices)
         self.val_dataset = Subset(train_deterministic, val_indices)
         self.test_dataset = MVTecDataset(
             root_dir=self.root_dir,
@@ -422,6 +423,11 @@ class MVTecDataModule:
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
         )
+
+    def fit_dataloader(self) -> DataLoader:
+        """Deterministic normal training images, disjoint from validation/test."""
+        return DataLoader(self.fit_dataset, batch_size=self.batch_size, shuffle=False,
+                          num_workers=self.num_workers, pin_memory=self.pin_memory)
 
     def test_dataloader(self) -> DataLoader:
         return DataLoader(

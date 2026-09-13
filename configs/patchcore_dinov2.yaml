@@ -1,0 +1,28 @@
+# Experimental DINO features + bounded-reservoir PatchCore variant.
+dataset:
+  path: ../data/MVTec
+  category: bottle
+model:
+  name: patchcore
+  backbone: dinov2_vits14
+  pretrained: true
+  image_size: [512, 512]
+  crop_scale: 1.0
+  params:
+    dino_layers: [11]
+    backbone_precision: bfloat16
+    max_patches: 10000
+    memory_bank_size: 1000
+    distance_chunk_size: 256
+loss:
+  name: none
+training:
+  device: cuda
+  batch_size: 1
+  epochs: 1
+  num_workers: 0
+evaluation:
+  num_visualizations: 0
+output:
+  save_dir: ../checkpoints
+  run_name: patchcore_dino_512

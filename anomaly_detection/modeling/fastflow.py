@@ -4,6 +4,8 @@ import torch.nn.functional as F
 from typing import List, Optional, Tuple
 import torchvision.models as models
 
+from anomaly_detection.modeling.dinov2 import DINO_MODELS, DinoFeatureExtractor, pad_to_patch_grid
+
 
 # -----------------------------
 # Glow-style invertible parts
@@ -197,33 +199,52 @@ class FastFlowModel(nn.Module):
         hidden_ratio: float = 1.0,
         clamp: float = 2.0,
         pretrained_backbone: bool = True,
+        dino_layers: Optional[List[int]] = None,
+        feature_channels: Optional[int] = None,
+        backbone_precision: str = "float32",
     ):
         super().__init__()
-        if input_size[0] % 16 != 0 or input_size[1] % 16 != 0:
+        self.is_dino = backbone_name in DINO_MODELS
+        if not self.is_dino and (input_size[0] % 16 != 0 or input_size[1] % 16 != 0):
             raise ValueError(
                 "FastFlow input_size height and width must be divisible by 16 "
                 f"for fixed LayerNorm shapes, got {input_size}."
             )
-        self.input_size = input_size
+        self.input_size = tuple(input_size)
+        self.padded_size = tuple(((v + 13) // 14) * 14 for v in input_size) if self.is_dino else self.input_size
+        if feature_channels is not None and (type(feature_channels) is not int or feature_channels < 2 or feature_channels % 2):
+            raise ValueError("FastFlow feature_channels must be a positive even integer >= 2.")
+        if feature_channels is not None and reducer_channels is not None:
+            raise ValueError("Specify feature_channels or reducer_channels, not both.")
         self.flow_steps = flow_steps
         self.conv3x3_only = conv3x3_only
         self.hidden_ratio = hidden_ratio
         self.clamp = clamp
 
-        self.feat_drop = nn.ModuleList([
-            nn.Dropout2d(p=0.2),  # try 0.05~0.2
-            nn.Dropout2d(p=0.2),
-            nn.Dropout2d(p=0.2),
-        ])
-        self.backbone, backbone_channels, self.scales = self._build_backbone(
-            backbone_name,
-            input_size,
-            pretrained=pretrained_backbone,
-        )
+        if self.is_dino:
+            self.backbone = DinoFeatureExtractor(
+                backbone_name, layers=dino_layers if dino_layers is not None else [11],
+                pretrained=pretrained_backbone, precision=backbone_precision,
+            )
+            # Transformer blocks share one patch grid, unlike ResNet stages.
+            # Concatenate selected blocks and model this fused feature space.
+            backbone_channels = [self.backbone.get_channels_dim()]
+            self.scales = [14]
+        else:
+            self.backbone, backbone_channels, self.scales = self._build_backbone(
+                backbone_name, input_size, pretrained=pretrained_backbone,
+            )
+        self.backbone.eval()
+        self.feat_drop = nn.ModuleList([nn.Dropout2d(p=0.2) for _ in backbone_channels])
 
         # reducers (optional)
         self.reducers = None
+        if feature_channels is not None:
+            reducer_channels = [feature_channels] * len(backbone_channels)
         if reducer_channels is not None:
+            if (len(reducer_channels) != len(backbone_channels) or
+                    any(type(c) is not int or c < 2 or c % 2 for c in reducer_channels)):
+                raise ValueError("reducer_channels must provide one positive even width per feature level.")
             self.reducers = nn.ModuleList([
                 nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
                 for in_ch, out_ch in zip(backbone_channels, reducer_channels)
@@ -237,8 +258,8 @@ class FastFlowModel(nn.Module):
 
         self.norms = nn.ModuleList()
         for ch, sc in zip(self.feature_channels, self.scales):
-            h = int(input_size[0] / sc)
-            w = int(input_size[1] / sc)
+            h = self.padded_size[0] // sc
+            w = self.padded_size[1] // sc
             self.norms.append(nn.LayerNorm([ch, h, w], elementwise_affine=True))
 
         # flows per feature level
@@ -253,7 +274,7 @@ class FastFlowModel(nn.Module):
                 steps.append(FastFlowStep(ch, hidden_ratio=hidden_ratio, kernel_size=k, clamp=clamp))
             self.blocks.append(steps)
 
-        self.anomaly_map_generator = AnomalyMapGenerator(input_size=input_size)
+        self.anomaly_map_generator = AnomalyMapGenerator(input_size=self.padded_size)
 
     def _build_backbone(self, name: str, input_size: Tuple[int, int], pretrained: bool = True):
         if name == "resnet18":
@@ -281,20 +302,22 @@ class FastFlowModel(nn.Module):
     def _extract_features(self, x: torch.Tensor) -> List[torch.Tensor]:
         # ResNet forward manually for layer1/2/3 features
         net = self.backbone
-        with torch.no_grad():
-            x = net.conv1(x)
-            x = net.bn1(x)
-            x = net.relu(x)
-            x = net.maxpool(x)
+        if self.is_dino:
+            feats = [net(pad_to_patch_grid(x))]
+        else:
+            with torch.no_grad():
+                x = net.conv1(x)
+                x = net.bn1(x)
+                x = net.relu(x)
+                x = net.maxpool(x)
 
-            f1 = net.layer1(x)  # scale /4
-            f2 = net.layer2(f1) # /8
-            f3 = net.layer3(f2) # /16
-
-        feats = [f1, f2, f3]
+                f1 = net.layer1(x)  # scale /4
+                f2 = net.layer2(f1) # /8
+                f3 = net.layer3(f2) # /16
+            feats = [f1, f2, f3]
 
         if self.reducers is not None:
-            feats = [self.reducers[i](feats[i]) for i in range(3)]
+            feats = [self.reducers[i](feat) for i, feat in enumerate(feats)]
 
         feats = [self.norms[i](feat) for i, feat in enumerate(feats)]
 
@@ -309,6 +332,8 @@ class FastFlowModel(nn.Module):
         return self
 
     def forward(self, x: torch.Tensor, return_latents: Optional[bool] = None):
+        if tuple(x.shape[-2:]) != self.input_size:
+            raise ValueError(f"FastFlow expects configured input_size {self.input_size}, got {tuple(x.shape[-2:])}.")
         # extract frozen features
         self.backbone.eval()
         features = self._extract_features(x)
@@ -332,4 +357,5 @@ class FastFlowModel(nn.Module):
         if return_latents:
             return hidden_variables, jacobians
 
-        return self.anomaly_map_generator(hidden_variables)
+        anomaly_map = self.anomaly_map_generator(hidden_variables)
+        return anomaly_map[..., :self.input_size[0], :self.input_size[1]]

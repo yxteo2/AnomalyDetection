@@ -2,12 +2,14 @@
 
 ## Scope
 
-SSN supports `dinov2_vits14` and `dinov2_vitb14` through timm, in addition to the
-three existing ResNet backbones. FastFlow still supports ResNet only: its flow
-stages assume the ResNet spatial hierarchy. Unsupported combinations fail early.
+FastFlow, SSN, PaDiM, PatchCore and the Dinomaly-style variant support
+`dinov2_vits14` and `dinov2_vitb14` through timm. All except Dinomaly also support
+the three existing ResNet backbones. See [detector choices](detector_choices.md)
+for fitting, losses and implementation scope. Unsupported combinations fail early.
 
-All backbones are frozen and kept in evaluation mode. Adapters, detection heads
-and flow modules remain trainable. DINOv2 uses timm's native PyTorch attention;
+All backbones are frozen and kept in evaluation mode. SSN, FastFlow and Dinomaly
+train their downstream modules; PaDiM/PatchCore fit statistics without gradients.
+DINOv2 uses timm's native PyTorch attention;
 there is no xFormers dependency or runtime import of Python from a GitHub URL.
 Pretrained weights download from the official timm Hugging Face model repository
 on first use. Checkpoints include the backbone weights, so inference rebuilds
@@ -69,7 +71,7 @@ small-defect sensitivity and runtime; more pixels are not automatically better.
   reduced precision.
 - `feature_channels: 128` projects channels before synthetic-feature duplication
   and the heads. `null` preserves the original channel count.
-- `training.accumulate_grad_batches` works for both detectors. Each microbatch
+- `training.accumulate_grad_batches` works for FastFlow, SSN and Dinomaly. Each microbatch
   is backpropagated immediately; gradients are sample-weighted, and a final
   partial window is flushed. No list of computation graphs is retained.
 - Accumulation is not mathematically identical to a larger physical batch for

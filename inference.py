@@ -375,6 +375,9 @@ class FastFlowInferenceEngine:
         device: str,
         topk_ratio: float,
         crop_scale: float = 0.875,
+        dino_layers: Optional[List[int]] = None,
+        feature_channels: Optional[int] = None,
+        backbone_precision: Optional[str] = None,
     ):
         self.device = torch.device(device if (device == "cuda" and torch.cuda.is_available()) else "cpu")
         ckpt = torch.load(checkpoint_path, map_location="cpu")
@@ -388,6 +391,7 @@ class FastFlowInferenceEngine:
         pretrained_backbone = bool(model_cfg.get("pretrained_backbone", pretrained_backbone))
         crop_scale = float(model_cfg.get("crop_scale", crop_scale))
         reducer_channels = model_cfg.get("reducer_channels")
+        feature_channels = model_cfg.get("feature_channels", feature_channels)
 
         self.image_size = tuple(image_size)
         self.backbone = backbone
@@ -395,29 +399,19 @@ class FastFlowInferenceEngine:
         if not 0.0 < self.topk_ratio <= 1.0:
             raise ValueError(f"topk_ratio must be in (0, 1], got {self.topk_ratio}")
 
-        if backbone == "wide_resnet50_2":
-            self.model = FastFlowModel(
-                backbone_name=backbone,
-                flow_steps=flow_steps,
-                input_size=self.image_size,
-                hidden_ratio=hidden_ratio,
-                reducer_channels=tuple(reducer_channels or (128, 192, 256)),
-                clamp=clamp,
-                conv3x3_only=conv3x3_only,
-                # The checkpoint contains the frozen backbone weights; avoid a
-                # redundant network download before strict state loading.
-                pretrained_backbone=False,
-            )
-        else:
-            self.model = FastFlowModel(
-                backbone_name=backbone,
-                flow_steps=flow_steps,
-                input_size=self.image_size,
-                hidden_ratio=hidden_ratio,
-                clamp=clamp,
-                conv3x3_only=conv3x3_only,
-                pretrained_backbone=False,
-            )
+        if backbone == "wide_resnet50_2" and feature_channels is None and reducer_channels is None:
+            reducer_channels = (128, 192, 256)
+        self.model = FastFlowModel(
+            backbone_name=backbone, flow_steps=flow_steps, input_size=self.image_size,
+            hidden_ratio=hidden_ratio, reducer_channels=reducer_channels,
+            clamp=clamp, conv3x3_only=conv3x3_only,
+            # Frozen backbone weights are already in the checkpoint.
+            pretrained_backbone=False,
+            dino_layers=model_cfg.get("dino_layers", dino_layers),
+            feature_channels=feature_channels,
+            backbone_precision=(backbone_precision if backbone_precision is not None
+                                else model_cfg.get("backbone_precision", "float32")),
+        )
 
         state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
         self.model.load_state_dict(state, strict=True)
@@ -760,6 +754,9 @@ def main():
     parser.add_argument("--conv3x3_only", action="store_true")
     parser.add_argument("--pretrained_backbone", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--topk_ratio", type=float, default=0.01)
+    parser.add_argument("--dino_layers", type=int, nargs="+", default=None)
+    parser.add_argument("--feature_channels", type=int, default=None)
+    parser.add_argument("--backbone_precision", choices=["float32", "bfloat16"], default=None)
 
     parser.add_argument("--save_dir", type=str, default="./inference_results")
     parser.add_argument("--min_area", type=int, default=30)
@@ -792,6 +789,9 @@ def main():
         pretrained_backbone=bool(args.pretrained_backbone),
         device=args.device,
         topk_ratio=args.topk_ratio,
+        dino_layers=args.dino_layers,
+        feature_channels=args.feature_channels,
+        backbone_precision=args.backbone_precision,
     )
 
     evaluator = MVTecFastFlowEvaluator(

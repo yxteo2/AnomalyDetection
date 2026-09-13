@@ -93,6 +93,7 @@ def make_dataset(root):
     ("fastflow", "fastflow_nll", "resnet18"), ("ssn", "ssn_focal", "resnet18"),
     ("ssn", "ssn_bce", "resnet18"), ("ssn", "ssn_bce_dice", "dinov2_vits14"),
     ("ssn", "ssn_focal_dice", "dinov2_vits14"),
+    ("fastflow", "fastflow_nll", "dinov2_vits14"),
 ])
 def test_yaml_runs_real_training_and_existing_inference(tmp_path, monkeypatch, model_name, loss_name, backbone):
     make_dataset(tmp_path / "data")
@@ -114,8 +115,10 @@ def test_yaml_runs_real_training_and_existing_inference(tmp_path, monkeypatch, m
     if model_name == "ssn":
         doc["training"].update(head_lr_multiplier=3.0, adaptor_weight_decay=0.005)
     if backbone.startswith("dinov2"):
-        doc["model"]["params"].update(feature_channels=128, adapt_cls_features=True, dino_layers=[11],
+        doc["model"]["params"].update(feature_channels=128, dino_layers=[11],
                                        backbone_precision="bfloat16")
+        if model_name == "ssn":
+            doc["model"]["params"]["adapt_cls_features"] = True
         doc["training"]["accumulate_grad_batches"] = 3  # Flush final two-batch partial window.
     path = tmp_path / "experiment.yaml"
     path.write_text(yaml.safe_dump(doc), encoding="utf-8")

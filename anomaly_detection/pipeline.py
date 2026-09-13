@@ -129,6 +129,8 @@ class AnomalyPipeline:
     def train(self):
         print("\n=== Starting Training ===")
         train_loader = self.data_module.train_dataloader()
+        if self.cfg["model"] in ("padim", "patchcore"):
+            train_loader = self.data_module.fit_dataloader()
         val_loader = self.data_module.val_dataloader()
 
         self.trainer.fit(
@@ -141,11 +143,12 @@ class AnomalyPipeline:
     def evaluate(self) -> Dict[str, Any]:
         print("\n=== Evaluating ===")
         # Evaluation needs neither gradients nor Adam momentum buffers on GPU.
-        self.trainer.optimizer.zero_grad(set_to_none=True)
-        self.trainer.optimizer.state.clear()
+        if self.trainer.optimizer is not None:
+            self.trainer.optimizer.zero_grad(set_to_none=True)
+            self.trainer.optimizer.state.clear()
         self.trainer.load_checkpoint("best_model.pth", load_optimizer=False)
 
-        if self.cfg["model"] == "ssn":
+        if self.cfg["model"] != "fastflow":
             self.evaluator = SuperSimpleNetEvaluator(model=self.model, device=str(self.device))
         else:
             self.evaluator = FastFlowEvaluator(model=self.model, device=str(self.device))

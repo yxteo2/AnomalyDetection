@@ -60,10 +60,12 @@ slashes (`C:/datasets/MVTec`) or single-quoted backslash paths.
 
 | Selection | Options |
 | --- | --- |
-| `model.backbone` | `resnet18`, `resnet34`, `wide_resnet50_2`; SSN additionally supports `dinov2_vits14`, `dinov2_vitb14` |
-| `model.name` | `fastflow`, `ssn` |
+| `model.backbone` | `resnet18`, `resnet34`, `wide_resnet50_2`, `dinov2_vits14`, `dinov2_vitb14` (Dinomaly requires DINOv2) |
+| `model.name` | `fastflow`, `ssn`, `padim`, `patchcore`, `dinomaly` |
 | FastFlow `loss.name` | `fastflow_nll` |
 | SSN `loss.name` | `ssn_focal`, `ssn_bce`, `ssn_bce_dice`, `ssn_focal_dice` |
+| PaDiM / PatchCore `loss.name` | `none` (one fitting pass, no optimizer) |
+| Dinomaly-style `loss.name` | `cosine`, `mse`, `smooth_l1`, `cosine_mse` |
 | `dataset.type` | `auto`, `mvtec`, `visa` |
 | `training.device` | `auto`, `cpu`, `cuda` |
 
@@ -73,7 +75,7 @@ a claimed performance improvement. Arbitrary combinations are invalid: flow
 latents/Jacobians and SSN segmentation/classification logits have different loss
 contracts. An incompatible combination is rejected before building a model.
 
-Both detectors support the three ResNet backbones. FastFlow uses ResNet stages
+FastFlow, SSN, PaDiM and PatchCore support the three ResNet backbones. FastFlow uses ResNet stages
 1–3; its `wide_resnet50_2` variant retains the existing channel reducers. SSN's
 feature stages are selectable. Pretrained initialization defaults to true;
 set `model.pretrained: false` for offline smoke tests. This is generally not a
@@ -83,7 +85,9 @@ For DINOv2, start with `configs/ssn_dinov2.yaml`. The frozen transformer returns
 patch-grid features, not ResNet stages. Bottom/right padding preserves coordinates
 at non-multiples of 14, and output maps are cropped back to the requested size.
 See [DINOv2 and GPU memory](gpu_memory.md) for the 416/512/704 configuration and
-memory test. DINOv2 + FastFlow is explicitly rejected, not silently substituted.
+memory test. FastFlow concatenates selected DINO blocks into one flow feature
+level. See [detector choices](detector_choices.md) for all new head parameters,
+memory controls and experimental differences from the original algorithms.
 
 ## Configuration sections
 
@@ -99,7 +103,7 @@ duplicate keys, invalid types and unsupported combinations produce errors.
 | `evaluation` | `image_threshold_quantile`, `pixel_threshold_quantile`, `num_visualizations` |
 | `output` | `save_dir`, `run_name`, `overwrite` |
 
-`image_size` is `[height, width]`, with both integers at least 32. FastFlow also
+`image_size` is `[height, width]`, with both integers at least 32. FastFlow with ResNet also
 requires both to be divisible by 16. `crop_scale` must be in `(0, 1]` and
 `dataset.val_ratio` strictly between 0 and 1. The dataset needs at least two
 normal training images to make separate training and validation subsets.
@@ -111,7 +115,8 @@ normal training images to make separate training and validation subsets.
 | FastFlow | `flow_steps: 8`, `hidden_ratio: 1.0`, `clamp: 2.0`, `conv3x3_only: false` |
 | SSN | `layers: [layer2, layer3]`, `perlin_threshold: 0.2`, `adapt_cls_features: false` |
 | SSN memory controls | `feature_channels: null` (positive integer requires `adapt_cls_features: true`) |
-| SSN DINOv2 | `dino_layers: [11]` (ordered unique block indices 0–11), `backbone_precision: float32` (`bfloat16` optionally runs the frozen backbone in BF16 on CUDA) |
+| FastFlow memory controls | `feature_channels: null` (or an even integer >= 2) |
+| All DINOv2 detectors | `dino_layers: [11]` (ordered unique block indices 0–11), `backbone_precision: float32` (`bfloat16` optionally runs the frozen backbone in BF16 on CUDA) |
 
 SSN layers must be unique members of `layer1` through `layer4`, in shallow-to-deep
 order. They are ResNet-only selectors; DINO uses `dino_layers`. The DINO selectors
