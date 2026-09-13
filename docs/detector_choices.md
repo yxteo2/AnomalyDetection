@@ -47,8 +47,10 @@ python -m anomaly_detection.predict --checkpoint path/to/best_model.pth \
   --image path/to/image.png --output prediction.pt --device cuda
 ```
 
-The output contains the raw anomaly score and map at the configured input size.
-It does not apply calibration or restore the source image's original size.
+The output contains the raw anomaly score, crop-space map and preprocessing
+geometry. Add `--restore-original` for a source-size display map and valid-region
+mask; cropped-away borders are marked NaN. It does not apply calibration.
+See the [inference guide](inference.md) for preprocessing parity and mask alignment.
 
 ## Implementation scope and memory
 

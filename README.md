@@ -28,6 +28,7 @@ losses, fitting behavior, runnable examples and differences from the papers.
 | `anomaly_detection/pipeline.py` | Shared experiment lifecycle |
 | `anomaly_detection/smoke.py` | Synthetic training/reload and CUDA peak-memory checks |
 | `anomaly_detection/predict.py` | Shared checkpoint reload and single-image prediction |
+| `anomaly_detection/preprocessing.py` | Shared resize, center crop, normalization and mask geometry |
 | `anomaly_detection/training/accumulation.py` | Sample-weighted gradient accumulation |
 | `configs/` | Ready-to-edit YAML experiments for all five detectors |
 | `docs/yaml_training.md` | YAML options, supported combinations and extension guide |
@@ -119,6 +120,10 @@ FastFlow with ResNet requires input height and width divisible by 16. Use
 Existing run folders require a new `--run_name` or explicit `--overwrite`.
 
 ## Inference
+
+For all five YAML-built detectors, use the shared command in the
+[inference and preprocessing guide](docs/inference.md). It reads the saved
+training crop settings and optionally returns source-size maps with valid-region masks.
 
 New checkpoints automatically provide their model configuration. Inference
 also automatically loads `calibration.json` from the checkpoint directory:

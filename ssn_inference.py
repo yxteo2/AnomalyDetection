@@ -7,7 +7,6 @@
 
 import argparse
 import json
-import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -15,7 +14,7 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 import torch
-from PIL import Image
+from anomaly_detection.preprocessing import InferencePreprocessing
 
 from anomaly_detection.modeling import SuperSimpleNetModel
 from anomaly_detection.config import BACKBONES
@@ -332,7 +331,7 @@ class Sample:
     gt_mask_orig: Optional[np.ndarray]
 
 
-class SSNInferenceEngine:
+class SSNInferenceEngine(InferencePreprocessing):
     def __init__(
         self,
         checkpoint_path: str,
@@ -348,8 +347,10 @@ class SSNInferenceEngine:
         feature_channels: Optional[int] = None,
         backbone_precision: Optional[str] = None,
     ):
-        self.device = torch.device(device if (device == "cuda" and torch.cuda.is_available()) else "cpu")
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        if device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested, but is unavailable.")
+        self.device = torch.device(device)
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         model_cfg = ckpt.get("model_cfg", {}) if isinstance(ckpt, dict) else {}
         backbone = model_cfg.get("backbone_name", backbone)
         image_size = tuple(model_cfg.get("input_size", image_size))
@@ -383,31 +384,7 @@ class SSNInferenceEngine:
         self.model.to(self.device)
         self.model.eval()
 
-        # EXACT transform: Resize -> CenterCrop -> Normalize (torchvision v2)
-        from torchvision.transforms import v2 as T
-
-        h, w = self.image_size
-        pre_h = int(math.ceil(h / crop_scale))
-        pre_w = int(math.ceil(w / crop_scale))
-
-        self.h, self.w = h, w
-        self.pre_h, self.pre_w = pre_h, pre_w
-        self.crop_top = (pre_h - h) // 2
-        self.crop_left = (pre_w - w) // 2
-
-        self.transform = T.Compose([
-            T.ToImage(),
-            T.Resize((pre_h, pre_w), antialias=True),
-            T.CenterCrop((h, w)),
-            T.ToDtype(torch.float32, scale=True),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-
-    def preprocess(self, image_path: str) -> Tuple[torch.Tensor, np.ndarray]:
-        pil = Image.open(image_path).convert("RGB")
-        orig_rgb = np.array(pil)
-        x = self.transform(pil).unsqueeze(0)  # [1,3,h,w]
-        return x, orig_rgb
+        self.setup_preprocessing(self.image_size, crop_scale)
 
     @torch.inference_mode()
     def infer_one(self, image_path: str) -> Tuple[float, np.ndarray, np.ndarray]:
@@ -423,24 +400,6 @@ class SSNInferenceEngine:
         amap_np = pred_map[0, 0].detach().cpu().numpy().astype(np.float32)  # [0,1]
         return score_val, amap_np, orig_rgb
 
-    def gt_mask_to_crop(self, gt_mask_orig: np.ndarray, orig_rgb: np.ndarray) -> np.ndarray:
-        """Convert original-size GT mask -> crop-space (h,w) mask aligned with anomaly map."""
-        H0, W0 = orig_rgb.shape[:2]
-        m = gt_mask_orig
-        if m.shape[:2] != (H0, W0):
-            m = cv2.resize(m, (W0, H0), interpolation=cv2.INTER_NEAREST)
-        m = cv2.resize(m, (self.pre_w, self.pre_h), interpolation=cv2.INTER_NEAREST)
-        t, l = self.crop_top, self.crop_left
-        m = m[t : t + self.h, l : l + self.w]
-        return ((m > 0).astype(np.uint8) * 255)
-
-    def uncrop_mask_to_original(self, orig_rgb: np.ndarray, mask_hw: np.ndarray) -> np.ndarray:
-        """Put crop-space mask back into pre-resize canvas, then resize to original image size."""
-        H0, W0 = orig_rgb.shape[:2]
-        canvas = np.zeros((self.pre_h, self.pre_w), dtype=np.uint8)
-        t, l = self.crop_top, self.crop_left
-        canvas[t : t + self.h, l : l + self.w] = mask_hw
-        return cv2.resize(canvas, (W0, H0), interpolation=cv2.INTER_NEAREST)
 
     def save_contour_overlay(
         self,
@@ -703,6 +662,7 @@ def main():
     parser.add_argument("--pretrained_backbone", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--image_size", type=int, nargs=2, default=[416, 416])  # H W
+    parser.add_argument("--crop_scale", type=float, default=0.875, help="Legacy checkpoint fallback; saved crop_scale takes precedence.")
 
     parser.add_argument("--save_dir", type=str, default="./ssn_inference_results")
     parser.add_argument("--min_area", type=int, default=30)
@@ -725,6 +685,7 @@ def main():
         checkpoint_path=args.checkpoint_path,
         backbone=args.backbone,
         image_size=tuple(args.image_size),
+        crop_scale=args.crop_scale,
         perlin_threshold=args.perlin_threshold,
         adapt_cls_features=args.adapt_cls_features,
         layers=list(args.layers),
